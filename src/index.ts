@@ -1,10 +1,12 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
 import express from "express";
-import { createWebhookApp, setDockerWorker, onIssue, onRetry } from "./webhook.js";
+import { createWebhookApp, setDockerWorker, onIssue, onRetry, setQueueStore } from "./webhook.js";
 import { handleIssue, retryQueuedIssue } from "./issue-handler.js";
 import { getConfig } from "./config.js";
 import { DockerWorker } from "./docker-worker.js";
+import { JsonQueueStore } from "./store.js";
+import { JobQueue } from "./queue.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -152,12 +154,23 @@ async function main() {
   console.log(`Port: ${config.listenPort}`);
   console.log("");
 
+  // Set up durable queue
+  const store = new JsonQueueStore();
+  const queue = new JobQueue(store, config.maxConcurrentWorkers);
+
+  // Recover interrupted jobs from previous run
+  const interrupted = store.recoverInterrupted(config.workerTimeoutMs);
+  if (interrupted.length > 0) {
+    console.log(`[queue] Recovered ${interrupted.length} interrupted job(s)`);
+  }
+
   // Register issue handler
   onIssue(handleIssue);
   onRetry(retryQueuedIssue);
 
   // Create webhook app
   const app = createWebhookApp();
+  setQueueStore(store);
 
   // Ensure worker image is ready
   const worker = new DockerWorker();
@@ -186,7 +199,7 @@ async function main() {
   }
 
   // Start Express server
-  const server = app.listen(config.listenPort, () => {
+  const server = app.listen(config.listenPort, async () => {
     console.log(`[server] Webhook listener: http://localhost:${config.listenPort}/webhook`);
     console.log(`[server] Health check: http://localhost:${config.listenPort}/health`);
     console.log(`[server] Stats: http://localhost:${config.listenPort}/api/stats`);
@@ -196,13 +209,19 @@ async function main() {
     if (ngrokUrl) {
       console.log(`Public URL: ${ngrokUrl}/webhook`);
     }
+
+    // Start queue processor
+    await queue.start();
+    console.log("[queue] Processor started");
   });
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     console.log(`\n[shutdown] ${signal} received...`);
     stopNgrokTunnels();
+    await queue.stop();
     await worker.stop();
+    store.save();
     server.close(() => {
       console.log("[shutdown] Server closed");
       process.exit(0);

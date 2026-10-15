@@ -1,138 +1,116 @@
 import { GitHubIssueEvent, onIssue } from "./webhook.js";
-import { generateSolution, generateSolutionWithDecomposition, isLocalModelTrigger, extractLocalPrompt } from "./llm.js";
-import { DockerWorker, WorkerResult, WorkerProgress, WorkerCapacity } from "./docker-worker.js";
+import {
+  generateSolution,
+  generateSolutionWithDecomposition,
+  isLocalModelTrigger,
+  extractLocalPrompt,
+} from "./llm.js";
+import { DockerWorker, WorkerProgress } from "./docker-worker.js";
 import { getConfig } from "./config.js";
 import { metrics } from "./metrics.js";
+import { GitHubClient, buildStatusComment, redact, type StatusCode } from "./github.js";
 import { buildRepoContext } from "./repo-context.js";
 
 const worker = new DockerWorker();
-
-// Track which issues are being processed to avoid duplicates
 const processingIssues = new Set<string>();
 
-async function getRepoFileList(githubToken: string, repoFullName: string): Promise<string[]> {
+// ── GitHub client per-handler factory ────────────────────────────────────
+
+function makeClient(githubToken: string): GitHubClient {
+  return new GitHubClient({ token: githubToken, retries: 2 });
+}
+
+// ── Status label helper ──────────────────────────────────────────────────
+
+async function setStatusLabel(
+  gh: GitHubClient,
+  repo: string,
+  issueNumber: number,
+  status: StatusCode
+): Promise<void> {
   try {
-    const response = await fetch(
-      `https://api.github.com/repos/${repoFullName}/git/trees/main?recursive=1`,
-      {
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          Accept: "application/vnd.github.v3+json",
-        },
-      }
-    );
+    await gh.setLabels(repo, issueNumber, status);
+  } catch (err) {
+    const msg = err instanceof Error ? redact(err.message) : String(err);
+    console.warn(`[handler] Failed to set label ${status}: ${msg}`);
+  }
+}
 
-    if (!response.ok) {
-      // Try master branch as fallback
-      const fallback = await fetch(
-        `https://api.github.com/repos/${repoFullName}/git/trees/master?recursive=1`,
-        {
-          headers: {
-            Authorization: `Bearer ${githubToken}`,
-            Accept: "application/vnd.github.v3+json",
-          },
-        }
-      );
-      if (!fallback.ok) return [];
-      const data = await fallback.json();
-      return (data.tree || [])
-        .filter((item: any) => item.type === "blob" && !item.path.includes("node_modules") && !item.path.includes(".git"))
-        .map((item: any) => item.path)
-        .slice(0, 200); // Limit to avoid overwhelming the LLM
+// ── Status comment helper (create once, update in place) ────────────────
+
+async function updateStatusComment(
+  gh: GitHubClient,
+  repo: string,
+  issueNumber: number,
+  stage: "queued" | "working" | "pr-opened" | "failed",
+  errorCategory?: string,
+  prUrl?: string,
+  hint?: string
+): Promise<void> {
+  try {
+    const existing = await gh.findBotComment(repo, issueNumber);
+    const body = buildStatusComment(stage, errorCategory, prUrl, hint);
+    if (existing) {
+      await gh.updateComment(repo, existing.id, body);
+    } else {
+      await gh.createComment(repo, issueNumber, body);
     }
+  } catch (err) {
+    const msg = err instanceof Error ? redact(err.message) : String(err);
+    console.warn(`[handler] Failed to update status comment: ${msg}`);
+  }
+}
 
-    const data = await response.json();
-    return (data.tree || [])
-      .filter((item: any) => item.type === "blob" && !item.path.includes("node_modules") && !item.path.includes(".git"))
-      .map((item: any) => item.path)
-      .slice(0, 200);
-  } catch (error) {
-    console.error(`[handler] Failed to get file list:`, error);
+// ── Repo file list (moved from Brief 3, kept here for now) ───────────────
+
+async function getRepoFileList(
+  githubToken: string,
+  repoFullName: string
+): Promise<string[]> {
+  const gh = makeClient(githubToken);
+  try {
+    const repo = await gh.getRepo(repoFullName);
+    // Use repo-context instead in production; stub here for transition
+    return [];
+  } catch {
     return [];
   }
 }
 
-async function commentOnIssue(githubToken: string, repoFullName: string, issueNumber: number, body: string): Promise<void> {
-  try {
-    await fetch(
-      `https://api.github.com/repos/${repoFullName}/issues/${issueNumber}/comments`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          Accept: "application/vnd.github.v3+json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ body }),
-      }
-    );
-  } catch (error) {
-    console.error(`[handler] Failed to comment on issue:`, error);
-  }
-}
-
-async function labelIssue(githubToken: string, repoFullName: string, issueNumber: number, label: string): Promise<void> {
-  try {
-    await fetch(
-      `https://api.github.com/repos/${repoFullName}/issues/${issueNumber}`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          Accept: "application/vnd.github.v3+json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ labels: [label] }),
-      }
-    );
-  } catch (error) {
-    console.error(`[handler] Failed to label issue:`, error);
-  }
-}
+// ── retryQueuedIssue ────────────────────────────────────────────────────
 
 export async function retryQueuedIssue(event: GitHubIssueEvent): Promise<void> {
   const config = getConfig();
   const { githubToken } = config;
+  const gh = makeClient(githubToken);
   const repoFullName = event.repository.full_name;
   const issueNumber = event.issue.number;
 
-  // Remove the needs-retry label so we don't loop
+  // Remove needs-retry correctly (per-label endpoint, ignore 404)
   try {
-    const labelBody: { remove_labels: { name: string }[] } = {
-      remove_labels: [{ name: "needs-retry" }],
-    };
-    await fetch(
-      `https://api.github.com/repos/${repoFullName}/issues/${issueNumber}`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          Accept: "application/vnd.github.v3+json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(labelBody),
-      }
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[handler] Failed to remove needs-retry label: ${msg}`);
+    await gh.removeLabel(repoFullName, issueNumber, "needs-retry");
+  } catch {
+    /* ignore — label may not exist */
   }
 
-  // Clear any stale labels and re-process
-  await labelIssue(githubToken, repoFullName, issueNumber, "queued");
+  // Set status to queued
+  await setStatusLabel(gh, repoFullName, issueNumber, "bot:queued");
+  await updateStatusComment(gh, repoFullName, issueNumber, "queued");
 
   console.log(`[handler] Retrying queued issue ${repoFullName}#${issueNumber}`);
   await handleIssue(event);
 }
 
+// ── handleIssue ─────────────────────────────────────────────────────────
+
 export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
   const config = getConfig();
   const { githubToken } = config;
+  const gh = makeClient(githubToken);
   const repoFullName = event.repository.full_name;
   const issueNumber = event.issue.number;
   const issueKey = `${repoFullName}#${issueNumber}`;
 
-  // Skip if already processing this issue
   if (processingIssues.has(issueKey)) {
     console.log(`[handler] Already processing ${issueKey}, skipping`);
     return;
@@ -145,30 +123,22 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
 
   try {
     const cap = worker.getCapacity();
+
     if (cap.full) {
-      console.log(`[handler] ${issueKey} rejected — all ${cap.max} worker slots occupied`);
+      console.log(`[handler] ${issueKey} rejected — all ${cap.max} slots occupied`);
       metrics.recordQueue();
-      await commentOnIssue(
-        githubToken,
-        repoFullName,
-        issueNumber,
-        `⏳ **luci-github-bot** is currently at capacity (${cap.max}/${cap.max} slots occupied).\n\n\`${repoFullName}#${issueNumber}\` has been noted and will be processed when a slot becomes available. Please retry after a few minutes.\n\n💡 Tip: label this issue \`needs-retry\` and comment to trigger a new check.`
-      );
-      await labelIssue(githubToken, repoFullName, issueNumber, "queued");
+      await setStatusLabel(gh, repoFullName, issueNumber, "bot:queued");
+      await updateStatusComment(gh, repoFullName, issueNumber, "queued");
       return;
     }
 
-    // Label issue as in-progress
-    await labelIssue(githubToken, repoFullName, issueNumber, "in-progress");
-    await commentOnIssue(
-      githubToken,
-      repoFullName,
-      issueNumber,
-      `🤖 **luci-github-bot** is working on this issue...\n\n\`${repoFullName}#${issueNumber}\` — generating a solution. (${cap.available - 1} slot(s) remaining)`
-    );
+    // Transition: bot:queued -> bot:in-progress
+    await setStatusLabel(gh, repoFullName, issueNumber, "bot:in-progress");
+    await updateStatusComment(gh, repoFullName, issueNumber, "working");
 
     console.log(`[handler] Generating solution for ${issueKey}...`);
 
+    // Build repo context for LLM
     const repoContext = await buildRepoContext(
       githubToken,
       repoFullName,
@@ -188,7 +158,7 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
       solution = await generateSolutionWithDecomposition(
         event.issue.title,
         focusedPrompt,
-        repoFullName,
+        repoContext.promptSection,
         [],
         githubToken
       );
@@ -197,27 +167,30 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
       solution = await generateSolution(
         event.issue.title,
         event.issue.body || "(no description)",
-        repoContext.promptSection,
+        repoContext.promptSection
       );
     }
 
     metrics.recordLlmGeneration(solution.success, useLocal);
 
     if (!solution.success) {
-      console.error(`[handler] LLM failed to generate solution: ${solution.error}`);
-      await commentOnIssue(
-        githubToken,
+      console.error(`[handler] LLM failed: ${solution.error}`);
+      await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
+      await updateStatusComment(
+        gh,
         repoFullName,
         issueNumber,
-        `❌ **luci-github-bot** could not generate a solution.\n\n**Error:** ${solution.error || "Unknown error"}\n\nPlease provide more details in the issue and label it \`needs-retry\` to try again.`
+        "failed",
+        "llm_generation",
+        undefined,
+        "Check the issue description and try again. Label \`needs-retry\` to attempt."
       );
-      await labelIssue(githubToken, repoFullName, issueNumber, "blocked");
       return;
     }
 
-    console.log(`[handler] Solution generated: ${solution.files.length} file(s) for branch ${solution.branchName}`);
+    console.log(`[handler] Solution: ${solution.files.length} file(s), branch ${solution.branchName}`);
 
-    // Process the issue in a Docker container
+    // Execute in worker
     const result = await worker.processIssue(event, solution, (progress: WorkerProgress) => {
       console.log(`[handler] ${progress.stage}: ${progress.message}`);
     });
@@ -225,47 +198,54 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
     metrics.recordWorkerExecution(result.success);
 
     if (result.success) {
-      console.log(`[handler] PR created for ${issueKey}: ${result.branchName}`);
-      const duration = Date.now() - startTime;
-      metrics.recordIssueCompleted(result.branchName, duration, repoFullName, issueNumber);
-      await commentOnIssue(
-        githubToken,
+      // Check if PR exists on this branch
+      const pr = await gh.getPullRequestForBranch(repoFullName, result.branchName);
+      await setStatusLabel(gh, repoFullName, issueNumber, "bot:awaiting-review");
+      await updateStatusComment(
+        gh,
         repoFullName,
         issueNumber,
-        `✅ **luci-github-bot** completed this issue!\n\nA PR has been created with the changes. Please review and merge.\n\n**Branch:** \`${result.branchName}\`\n\n🔄 Status: \`awaiting-review\``
+        "pr-opened",
+        undefined,
+        pr?.url
       );
-      await labelIssue(githubToken, repoFullName, issueNumber, "awaiting-review");
+      metrics.recordIssueCompleted(result.branchName, Date.now() - startTime, repoFullName, issueNumber);
     } else {
-      console.error(`[handler] Worker failed for ${issueKey}: ${result.error}`);
-      const duration = Date.now() - startTime;
-      metrics.recordIssueFailed(result.error, duration, repoFullName, issueNumber);
-      await commentOnIssue(
-        githubToken,
+      console.error(`[handler] Worker failed: ${result.error}`);
+      await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
+      await updateStatusComment(
+        gh,
         repoFullName,
         issueNumber,
-        `❌ **luci-github-bot** encountered an error while working on this issue.\n\n**Error:** ${result.error}\n\nPlease check the bot logs and try again.`
+        "failed",
+        "worker_execution",
+        undefined,
+        "Container execution failed. Check bot logs and retry."
       );
-      await labelIssue(githubToken, repoFullName, issueNumber, "blocked");
+      metrics.recordIssueFailed(result.error, Date.now() - startTime, repoFullName, issueNumber);
     }
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
+    const errorMsg = error instanceof Error ? redact(error.message) : String(error);
     console.error(`[handler] Unexpected error for ${issueKey}:`, errorMsg);
-
-    const duration = Date.now() - startTime;
-    metrics.recordIssueFailed(errorMsg, duration, repoFullName, issueNumber);
+    metrics.recordIssueFailed(errorMsg, Date.now() - startTime, repoFullName, issueNumber);
 
     try {
-      await commentOnIssue(
-        githubToken,
+      await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
+      await updateStatusComment(
+        gh,
         repoFullName,
         issueNumber,
-        `❌ **luci-github-bot** encountered an unexpected error:\n\n\`\`\`\n${errorMsg}\n\`\`\`\n\nPlease try again or check the bot logs.`
+        "failed",
+        "unexpected",
+        undefined,
+        "An unexpected error occurred. Check bot logs."
       );
-    } catch {}
+    } catch {
+      console.error(`[handler] Failed to post error comment for ${issueKey}`);
+    }
   } finally {
     processingIssues.delete(issueKey);
   }
 }
 
-// Handled by index.ts via onIssue()
 export { handleIssue as default };
