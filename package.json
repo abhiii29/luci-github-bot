@@ -1,0 +1,26 @@
+{
+  "name": "luci-github-bot",
+  "version": "0.1.0",
+  "description": "Automated GitHub issue-to-PR bot using Qwen AI",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "docker:build": "docker build -t luci-github-bot-worker -f Dockerfile.worker .",
+    "podman:build": "podman build -t luci-github-bot-worker -f Dockerfile.worker .",
+    "build:all": "npm run build && npm run podman:build",
+    "start:bot": "bash bin/start-bot.sh",
+    "stop:podman": "podman machine stop 2>/dev/null || true"
+  },
+  "dependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "express": "^5.0.0",
+    "openai": "^4.87.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "zod": "^3.24.0"
+  }
+}

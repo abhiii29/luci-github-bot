@@ -1,0 +1,30 @@
+FROM node:22-slim
+
+# Install git and GitHub CLI
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install gh (GitHub CLI)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure git
+RUN git config --global init.defaultBranch main \
+    && git config --global advice.detachedHead false \
+    && git config --global user.email "luci-github-bot@users.noreply.github.com" \
+    && git config --global user.name "luci-github-bot" \
+    && git config --global --add safe.directory "*"
+
+WORKDIR /workspace
+
+# Copy the worker script
+COPY images/worker.sh /worker.sh
+RUN chmod +x /worker.sh
+
+# Entry point
+ENTRYPOINT ["/worker.sh"]
