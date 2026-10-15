@@ -118,7 +118,7 @@ Generate code for ONLY the files listed above. Output ONLY the structured respon
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function substituteTemplate(template: string, values: string[]): string {
+export function substituteTemplate(template: string, values: string[]): string {
   return template.replace(/%s/g, () => values.shift() ?? "");
 }
 

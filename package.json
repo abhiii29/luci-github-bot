@@ -10,6 +10,7 @@
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:regression": "vitest run tests/regression/",
     "typecheck": "tsc --noEmit",
     "docker:build": "docker build -t luci-github-bot-worker -f Dockerfile.worker .",
     "podman:build": "podman build -t luci-github-bot-worker -f Dockerfile.worker .",
