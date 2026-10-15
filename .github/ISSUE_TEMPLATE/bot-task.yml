@@ -1,0 +1,73 @@
+name: Bot Task
+description: Create a task for the luci-github-bot to process
+title: "[bot]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Bot Task Form
+
+        Use this form to submit tasks to the luci-github-bot. The bot will process assigned issues automatically.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One-sentence summary of what needs to be done
+      placeholder: "Add rate limiting to the webhook handler"
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: What needs to be true for this task to be considered complete
+      placeholder: |
+        - Webhook handler rejects requests exceeding 100/min per IP
+        - 429 response with retry-after header when limit exceeded
+        - Rate limit state stored in memory
+    validations:
+      required: true
+
+  - type: textarea
+    id: target_files
+    attributes:
+      label: Target Files (optional)
+      description: Specific files to modify, one per line. Leave empty for the bot to determine.
+      placeholder: |
+        src/webhook.ts
+        src/rate-limiter.ts
+    validations:
+      required: false
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Any constraints, dependencies, or special requirements
+      placeholder: "Do not add external dependencies"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: model
+    attributes:
+      label: Model
+      description: Which model to use for code generation
+      options:
+        - remote (default, 35B+ cloud model)
+        - local (7B-8B local Ollama model, slower but offline)
+      default: 0
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: plan_first
+    attributes:
+      label: Plan First
+      description: Generate a plan before writing code (use /luci go to execute)
+      options:
+        - label: Generate a plan first, review, then execute
+          required: false
