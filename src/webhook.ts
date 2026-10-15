@@ -4,10 +4,20 @@ import { getConfig } from "./config.js";
 import { DockerWorker } from "./docker-worker.js";
 import { ResourceStats } from "./resource-monitor.js";
 import { metrics } from "./metrics.js";
+import { parseDirectives } from "./directives.js";
+import { loadRepoConfig } from "./repo-config.js";
+import type { JobOptions } from "./types.js";
 
 let dockerWorker: DockerWorker | null = null;
 type RetryHandler = (event: GitHubIssueEvent) => Promise<void>;
 let retryHandler: RetryHandler | null = null;
+
+/** Cached result of collaborator/owner checks. */
+const collaboratorCache = new Map<string, { isCollab: boolean; timestamp: number }>();
+const COLLABORATOR_CACHE_TTL_MS = 300_000; // 5 min
+
+const repoConfigCache = new Map<string, { result: import("./repo-config.js").RepoConfigResult; timestamp: number }>();
+const REPO_CONFIG_CACHE_TTL_MS = 300_000;
 
 export function setDockerWorker(worker: DockerWorker): void {
   dockerWorker = worker;
@@ -20,6 +30,40 @@ export function onRetry(handler: RetryHandler): void {
 export function __resetWebhookState(): void {
   handlers.length = 0;
   retryHandler = null;
+  collaboratorCache.clear();
+  repoConfigCache.clear();
+}
+
+/** Check whether a user is a collaborator/owner of a repo (cached). */
+async function checkCollaborator(
+  githubToken: string,
+  repoFullName: string,
+  username: string
+): Promise<boolean> {
+  const now = Date.now();
+  const cacheKey = `${repoFullName}:${username}`;
+  const cached = collaboratorCache.get(cacheKey);
+  if (cached && now - cached.timestamp < COLLABORATOR_CACHE_TTL_MS) {
+    return cached.isCollab;
+  }
+
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repoFullName}/collaborators/${username}`,
+      {
+        headers: {
+          Authorization: `Bearer ${githubToken}`,
+          Accept: "application/vnd.github.v3+json",
+        },
+      }
+    );
+    const isCollab = res.ok;
+    collaboratorCache.set(cacheKey, { isCollab, timestamp: now });
+    return isCollab;
+  } catch {
+    collaboratorCache.set(cacheKey, { isCollab: false, timestamp: now });
+    return false;
+  }
 }
 
 export type HealthStats = {
@@ -57,6 +101,7 @@ export interface GitHubIssueEvent {
     user: { login: string };
     created_at: string;
     updated_at: string;
+    pull_request?: { url?: string };
   };
   repository: {
     full_name: string;
@@ -64,6 +109,8 @@ export interface GitHubIssueEvent {
     private: boolean;
   };
   sender: { login: string };
+  changes?: { assignee?: { login?: string } };
+  jobOptions?: JobOptions;
 }
 
 // Type guard for webhook event
@@ -110,7 +157,7 @@ export function createWebhookApp(): express.Express {
       }
       next();
     },
-    (req: Request, res: Response) => {
+    (async (req: Request, res: Response) => {
       const signature =
         req.headers["x-hub-signature-256"] as string | undefined;
 
@@ -179,15 +226,81 @@ export function createWebhookApp(): express.Express {
       }
 
       if (event.action === "assigned" && event.issue.assignee) {
+        // Skip if the bot assigned itself
+        if (event.sender.login === config.botUsername) {
+          console.log(
+            `[webhook] Ignoring self-assignment #${event.issue.number}`
+          );
+          return res.status(200).json({ status: "ignored" });
+        }
+
+        // Skip closed issues
+        if (event.issue.state === "closed") {
+          console.log(
+            `[webhook] Ignoring closed issue #${event.issue.number}`
+          );
+          return res.status(200).json({ status: "ignored" });
+        }
+
+        // Skip pull requests (issues with pull_request field)
+        if (event.issue.pull_request) {
+          console.log(
+            `[webhook] Ignoring PR #${event.issue.number}`
+          );
+          return res.status(200).json({ status: "ignored" });
+        }
+
+        // Skip issues with bot:no-run label
+        if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
+          console.log(
+            `[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`
+          );
+          return res.status(200).json({ status: "ignored" });
+        }
+
+        // Skip reassignments from another user to the bot
+        if (event.changes?.assignee?.login) {
+          console.log(
+            `[webhook] Ignoring reassignment #${event.issue.number}`
+          );
+          return res.status(200).json({ status: "ignored" });
+        }
+
+        // Check assignee matches bot
         if (event.issue.assignee.login !== config.botUsername) {
           console.log(
             `[webhook] Ignoring assign #${event.issue.number} — assigned to ${event.issue.assignee.login}`
           );
           return res.status(200).json({ status: "ignored", assignee: event.issue.assignee.login });
         }
+
         console.log(
           `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
         );
+
+        // Parse per-repo config and directives
+        const [repoConfigResult, directivesResult] = await Promise.all([
+          loadRepoConfig(
+            config.githubToken,
+            event.repository.full_name,
+            repoConfigCache,
+            REPO_CONFIG_CACHE_TTL_MS
+          ),
+          checkCollaborator(
+            config.githubToken,
+            event.repository.full_name,
+            event.issue.user.login
+          ).then((isCollab) =>
+            parseDirectives(
+              event.issue.title,
+              event.issue.body,
+              isCollab
+            )
+          ),
+        ]);
+
+        event.jobOptions = directivesResult.jobOptions;
+
         handlers.forEach(async (handler) => {
           try {
             await handler(event);
@@ -202,7 +315,7 @@ export function createWebhookApp(): express.Express {
       }
 
       return res.status(200).json({ status: "ignored" });
-    }
+    })
   );
 
   // Health check endpoint
