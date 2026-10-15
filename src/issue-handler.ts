@@ -3,6 +3,7 @@ import { generateSolution, generateSolutionWithDecomposition, isLocalModelTrigge
 import { DockerWorker, WorkerResult, WorkerProgress, WorkerCapacity } from "./docker-worker.js";
 import { getConfig } from "./config.js";
 import { metrics } from "./metrics.js";
+import { buildRepoContext } from "./repo-context.js";
 
 const worker = new DockerWorker();
 
@@ -168,8 +169,13 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
 
     console.log(`[handler] Generating solution for ${issueKey}...`);
 
-    // Get repo file list for context
-    const existingFiles = await getRepoFileList(githubToken, repoFullName);
+    const repoContext = await buildRepoContext(
+      githubToken,
+      repoFullName,
+      event.issue.title,
+      event.issue.body || ""
+    );
+    console.log(`[handler] Loaded ${repoContext.fileCount} file(s) for context`);
 
     // Generate solution: use decomposition pipeline for local model, single-shot for remote
     const bodyOrNull = event.issue.body;
@@ -183,15 +189,15 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
         event.issue.title,
         focusedPrompt,
         repoFullName,
-        existingFiles
+        [],
+        githubToken
       );
     } else {
       console.log(`[handler] Using remote LLM (single-shot)`);
       solution = await generateSolution(
         event.issue.title,
         event.issue.body || "(no description)",
-        repoFullName,
-        existingFiles
+        repoContext.promptSection,
       );
     }
 
