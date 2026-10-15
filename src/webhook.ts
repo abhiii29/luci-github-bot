@@ -17,6 +17,11 @@ export function onRetry(handler: RetryHandler): void {
   retryHandler = handler;
 }
 
+export function __resetWebhookState(): void {
+  handlers.length = 0;
+  retryHandler = null;
+}
+
 export type HealthStats = {
   status: "ok" | "degraded";
   timestamp: string;

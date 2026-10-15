@@ -519,7 +519,7 @@ export async function generateSolutionWithDecomposition(
 // Existing single-shot parser (unchanged)
 // ---------------------------------------------------------------------------
 
-function parseLLMResponse(content: string): CodeGenerationResult {
+export function parseLLMResponse(content: string): CodeGenerationResult {
   const normalized = content
     .split("\n")
     .map((line) => line.replace(/\r$/, ""))
@@ -662,7 +662,7 @@ function parseLLMResponseFallback(content: string): CodeGenerationResult {
   return { success: files.length > 0, files, branchName, commitMessage };
 }
 
-function parseDecompositionResponse(content: string): DecompositionResult {
+export function parseDecompositionResponse(content: string): DecompositionResult {
   let cleaned = content.trim();
   const fenceMatch = cleaned.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
   if (fenceMatch) cleaned = fenceMatch[1].trim();
