@@ -4,10 +4,12 @@ import { getConfig } from "./config.js";
 import { DockerWorker } from "./docker-worker.js";
 import { ResourceStats } from "./resource-monitor.js";
 import { metrics } from "./metrics.js";
+import { JsonQueueStore } from "./store.js";
 
 let dockerWorker: DockerWorker | null = null;
 type RetryHandler = (event: GitHubIssueEvent) => Promise<void>;
 let retryHandler: RetryHandler | null = null;
+let queueStore: JsonQueueStore | null = null;
 
 export function setDockerWorker(worker: DockerWorker): void {
   dockerWorker = worker;
@@ -15,6 +17,10 @@ export function setDockerWorker(worker: DockerWorker): void {
 
 export function onRetry(handler: RetryHandler): void {
   retryHandler = handler;
+}
+
+export function setQueueStore(store: JsonQueueStore): void {
+  queueStore = store;
 }
 
 export function __resetWebhookState(): void {
@@ -178,13 +184,40 @@ export function createWebhookApp(): express.Express {
         }
       }
 
-      if (event.action === "assigned" && event.issue.assignee) {
+       if (event.action === "assigned" && event.issue.assignee) {
         if (event.issue.assignee.login !== config.botUsername) {
           console.log(
             `[webhook] Ignoring assign #${event.issue.number} — assigned to ${event.issue.assignee.login}`
           );
           return res.status(200).json({ status: "ignored", assignee: event.issue.assignee.login });
         }
+
+        const deliveryId = (req.headers["x-github-delivery"] as string) ?? "";
+        if (queueStore && queueStore.deliveryReceived(deliveryId)) {
+          console.log(`[webhook] Duplicate delivery ${deliveryId}, ignoring`);
+          return res.status(200).json({ status: "ignored", reason: "duplicate" });
+        }
+
+        if (queueStore) {
+          const openJob = queueStore.getOpenJobPerIssue(
+            event.repository.full_name,
+            event.issue.number
+          );
+          if (openJob) {
+            console.log(
+              `[webhook] Issue #${event.issue.number} already has open job ${openJob.id}, ignoring`
+            );
+            return res.status(200).json({ status: "ignored", reason: "already_queued" });
+          }
+          queueStore.enqueue(
+            event.repository.full_name,
+            event.issue.number,
+            { action: event.action, title: event.issue.title }
+          );
+          metrics.recordQueue();
+          return res.status(200).json({ status: "queued" });
+        }
+
         console.log(
           `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
         );

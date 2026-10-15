@@ -30,6 +30,7 @@ export interface MetricsSnapshot {
   }>;
   uptimeSeconds: number;
   startTime: string;
+  queueDepth: number;
 }
 
 interface ActivityEntry {
@@ -51,6 +52,7 @@ export class MetricsCollector {
   private recentActivity: ActivityEntry[] = [];
   private startTime: number;
   private maxRecentEntries = 100;
+  private _queueDepth = 0;
 
   constructor() {
     this.startTime = Date.now();
@@ -134,6 +136,10 @@ export class MetricsCollector {
     }
   }
 
+  setQueueDepth(depth: number): void {
+    this._queueDepth = depth;
+  }
+
   getSnapshot(): MetricsSnapshot {
     return {
       totalIssuesProcessed: this.issuesProcessed,
@@ -143,6 +149,7 @@ export class MetricsCollector {
       recentActivity: this.recentActivity.slice(-20).map((a) => ({ ...a })),
       uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
       startTime: new Date(this.startTime).toISOString(),
+      queueDepth: this._queueDepth,
     };
   }
 
