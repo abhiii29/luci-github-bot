@@ -1,10 +1,12 @@
 import { execFile } from "child_process";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GitHubIssueEvent } from "./webhook.js";
 import { getConfig } from "./config.js";
 import { CodeGenerationResult } from "./llm.js";
 import { ResourceMonitor, ResourceStats } from "./resource-monitor.js";
+import { validateSolution } from "./solution-validator.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -426,8 +428,8 @@ export class DockerWorker {
   }
 
   /**
-   * Process a GitHub issue in an ephemeral container.
-   */
+    * Process a GitHub issue in an ephemeral container.
+    */
   async processIssue(
     event: GitHubIssueEvent,
     solution: CodeGenerationResult,
@@ -439,6 +441,22 @@ export class DockerWorker {
     const branchName = solution.branchName || `bot/issue-${issueNumber}`;
     const containerName = `luci-bot-${issueNumber}-${Date.now().toString(36)}`;
 
+    const validation = validateSolution(
+      branchName,
+      solution.commitMessage,
+      solution.files,
+    );
+    if (!validation.valid) {
+      const reason = validation.errors.map(e => e.reason).join("; ");
+      console.error(`[worker] Solution validation failed for #${issueNumber}: ${reason}`);
+      return {
+        success: false,
+        branchName,
+        issueNumber,
+        error: `Solution validation failed: ${reason}`,
+      };
+    }
+
     onProgress?.({
       stage: "starting",
       message: `Queued: ${repoFullName}#${issueNumber}`,
@@ -447,6 +465,7 @@ export class DockerWorker {
     // Acquire semaphore slot
     await this.semaphore.acquire();
     let containerId: string | null = null;
+    const solutionPath = "/tmp/.luci-solution.json";
 
     try {
       onProgress?.({
@@ -467,7 +486,6 @@ export class DockerWorker {
         // Image already local or build is in progress
       }
 
-      // Prepare environment variables
       const env = [
         `GITHUB_TOKEN=${config.githubToken}`,
         `REPO_FULL_NAME=${repoFullName}`,
@@ -476,13 +494,36 @@ export class DockerWorker {
         `COMMIT_MESSAGE=${solution.commitMessage}`,
         `GIT_AUTHOR_NAME=${config.gitAuthorName}`,
         `GIT_AUTHOR_EMAIL=${config.gitAuthorEmail}`,
-        `CODE_SOLUTION=${JSON.stringify(solution)}`,
+        `SOLUTION_FILE=${solutionPath}`,
         `WORKER_TIMEOUT_MS=${config.workerTimeoutMs}`,
       ];
 
+      const containerArgs: string[] = [];
+      if (config.containerMemory) containerArgs.push("--memory", config.containerMemory);
+      if (config.containerCpus) containerArgs.push("--cpus", String(config.containerCpus));
+      if (config.containerPidsLimit) containerArgs.push("--pids-limit", String(config.containerPidsLimit));
+      containerArgs.push("--cap-drop=ALL");
+      containerArgs.push("--security-opt", "no-new-privileges");
+      containerArgs.push("--read-only");
+      containerArgs.push("--tmpfs", "/tmp:rw,noexec,nosuid,size=64m");
+      containerArgs.push("--tmpfs", "/home:rw,noexec,nosuid,size=16m");
+
+      const solutionJson = JSON.stringify({
+        branchName: solution.branchName,
+        commitMessage: solution.commitMessage,
+        files: solution.files,
+      });
+      fs.writeFileSync(solutionPath, solutionJson);
+      containerArgs.push("--mount", `type=bind,source=${solutionPath},target=${solutionPath},ro`);
+
       // Create container
       onProgress?.({ stage: "running", message: "Creating container..." });
-      const { id } = await this.runtime.create(this.imageTag, env, containerName);
+      const envArgs = env.flatMap((e) => ["-e", e]);
+      const { id } = await this.runtime.create(
+        this.imageTag,
+        [...envArgs, ...containerArgs],
+        containerName
+      );
       containerId = id;
 
       onProgress?.({
@@ -544,6 +585,10 @@ export class DockerWorker {
         } catch {}
       }
       this.semaphore.release();
+      // Remove temporary solution file
+      try {
+        fs.unlinkSync(solutionPath);
+      } catch {}
     }
   }
 
