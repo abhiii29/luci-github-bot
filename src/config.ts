@@ -25,6 +25,7 @@ const configSchema = z.object({
   containerMemory: z.string().optional(),
   containerCpus: z.coerce.number().optional(),
   containerPidsLimit: z.coerce.number().optional(),
+  apiToken: z.string().optional(),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -100,6 +101,7 @@ export function getConfig(): Config {
     containerMemory: env.CONTAINER_MEMORY,
     containerCpus: env.CONTAINER_CPUS,
     containerPidsLimit: env.CONTAINER_PIDS_LIMIT,
+    apiToken: env.API_TOKEN || undefined,
   };
 
   const resolvedRepos = parseMonitoredRepos(raw.monitoredRepos);
