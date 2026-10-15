@@ -5,16 +5,24 @@ import { createWebhookApp, setDockerWorker, onIssue, onRetry } from "./webhook.j
 import { handleIssue, retryQueuedIssue } from "./issue-handler.js";
 import { getConfig } from "./config.js";
 import { DockerWorker } from "./docker-worker.js";
+import { logger } from "./logger.js";
+import { redact, addSecret } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
 
 // Track active ngrok processes for cleanup
 let ngrokProcesses: ReturnType<typeof execFile>[] = [];
 
-async function startNgrokTunnel(port: number, authToken: string): Promise<string> {
-  console.log("[ngrok] Starting tunnel...");
+// Shutdown hooks registered by other modules
+const shutdownHooks: Array<() => Promise<void>> = [];
 
-  // Start ngrok CLI process
+export function onShutdown(fn: () => Promise<void>): void {
+  shutdownHooks.push(fn);
+}
+
+async function startNgrokTunnel(port: number, authToken: string): Promise<string> {
+  logger.info("[ngrok] Starting tunnel...");
+
   const ngrok = execFile(
     "ngrok",
     ["http", port.toString(), "--log", "stdout"],
@@ -32,9 +40,8 @@ async function startNgrokTunnel(port: number, authToken: string): Promise<string
 
     ngrok.stdout?.on("data", (data: Buffer) => {
       output += data.toString();
-      console.log(`[ngrok] ${data.toString().trim()}`);
+      logger.info(`[ngrok] ${data.toString().trim()}`);
 
-      // Look for the tunnel URL in ngrok output
       if (!connected) {
         const urlMatch = output.match(/https:\/\/([a-zA-Z0-9-]+\.)?ngrok-free\.(app|dev)/);
         if (urlMatch) {
@@ -45,7 +52,7 @@ async function startNgrokTunnel(port: number, authToken: string): Promise<string
     });
 
     ngrok.stderr?.on("data", (data: Buffer) => {
-      console.error(`[ngrok-err] ${data.toString().trim()}`);
+      logger.warn(`[ngrok] ${redact(data.toString().trim())}`);
     });
 
     ngrok.on("error", (err) => {
@@ -58,7 +65,6 @@ async function startNgrokTunnel(port: number, authToken: string): Promise<string
       }
     });
 
-    // Timeout after 15s
     setTimeout(() => {
       if (!connected) {
         ngrok.kill();
@@ -81,11 +87,10 @@ async function registerWebhook(ngrokUrl: string, config: ReturnType<typeof getCo
   const repos = config.monitoredRepos;
   const webhookUrl = `${ngrokUrl}/webhook`;
 
-  console.log(`[webhook] Registering webhook at: ${webhookUrl}`);
+  logger.info(`[webhook] Registering webhook at: ${webhookUrl}`);
 
   for (const repo of repos) {
     try {
-      // Check if webhook already exists
       const existing = await fetch(
         `https://api.github.com/repos/${repo}/hooks`,
         {
@@ -102,12 +107,11 @@ async function registerWebhook(ngrokUrl: string, config: ReturnType<typeof getCo
           (h: any) => h.config?.url === webhookUrl && h.events?.includes("issues")
         );
         if (exists) {
-          console.log(`[webhook] Already registered for ${repo}`);
+          logger.info(`[webhook] Already registered for ${repo}`);
           continue;
         }
       }
 
-      // Create new webhook
       const response = await fetch(`https://api.github.com/repos/${repo}/hooks`, {
         method: "POST",
         headers: {
@@ -128,85 +132,155 @@ async function registerWebhook(ngrokUrl: string, config: ReturnType<typeof getCo
       });
 
       if (response.ok) {
-        console.log(`[webhook] Registered for ${repo}`);
+        logger.info(`[webhook] Registered for ${repo}`);
       } else {
         const error = await response.text();
-        console.error(`[webhook] Failed for ${repo}: ${error}`);
+        logger.error(`[webhook] Failed for ${repo}: ${redact(error)}`);
       }
     } catch (error) {
-      console.error(`[webhook] Error for ${repo}:`, error);
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error(`[webhook] Error for ${repo}: ${redact(msg)}`);
     }
   }
+}
+
+function validateStartup(config: ReturnType<typeof getConfig>): string[] {
+  const problems: string[] = [];
+
+  if (!config.githubToken || config.githubToken.length < 10) {
+    problems.push("GITHUB_TOKEN: missing or too short");
+  }
+
+  if (!config.webhookSecret || config.webhookSecret.length < 16) {
+    problems.push("WEBHOOK_SECRET: required and must be at least 16 characters");
+  }
+
+  const apiKeyPath = config.adassoApiKeyFile.replace(/^~($|\/)/, process.env.HOME + "/");
+  try {
+    require("fs").accessSync(apiKeyPath, require("fs").constants.R_OK);
+  } catch {
+    problems.push(`API key file not readable: ${config.adassoApiKeyFile}`);
+  }
+
+  for (const repo of config.monitoredRepos) {
+    if (!repo.includes("/")) {
+      problems.push(`MONITORED_REPOS: invalid format "${repo}". Use owner/repo`);
+    }
+  }
+
+  if (!config.botUsername) {
+    problems.push("Bot username: undetectable (set GITHUB_BOT_USERNAME)");
+  }
+
+  const hasNgrok = !!(config.ngrokAuthToken && config.ngrokAuthToken.length > 10);
+  if (hasNgrok) {
+    const ngrokBin = require("child_process").execFileSync("which", ["ngrok"], {
+      timeout: 5000,
+      stdio: ["pipe", "pipe", "ignore"],
+    }).toString().trim();
+    if (!ngrokBin) {
+      problems.push("ngrok binary: not found in PATH (tunnel will not start automatically)");
+    }
+  }
+
+  addSecret(config.webhookSecret);
+  addSecret(config.githubToken);
+
+  return problems;
 }
 
 async function main() {
   const config = getConfig();
 
-  console.log("=== luci-github-bot ===");
-  console.log(`Runtime: ${config.containerRuntime}`);
-  console.log(`Max concurrent workers: ${config.maxConcurrentWorkers}`);
-  console.log(`Hub: ${config.adassoBaseUrl}`);
-  console.log(`Model: ${config.adassoModel}`);
-  console.log(`Bot user: ${config.botUsername}`);
-  console.log(`Monitored repos: ${config.monitoredRepos.join(", ")}`);
-  console.log(`Port: ${config.listenPort}`);
-  console.log("");
+  // Startup validation
+  const problems = validateStartup(config);
+  if (problems.length > 0) {
+    console.error("=== Startup validation failed ===");
+    for (const p of problems) {
+      console.error(`  - ${p}`);
+    }
+    console.error("Fix the issues above and restart.");
+    process.exit(1);
+  }
 
-  // Register issue handler
+  // Warn about API_TOKEN
+  if (!config.apiToken) {
+    console.error("[startup] WARNING: API_TOKEN not set. /api/* routes bound to localhost only.");
+  }
+
+  logger.info("=== luci-github-bot ===", {
+    runtime: config.containerRuntime,
+    maxWorkers: config.maxConcurrentWorkers,
+    model: config.adassoModel,
+    botUsername: config.botUsername,
+    repos: config.monitoredRepos,
+    port: config.listenPort,
+  });
+
   onIssue(handleIssue);
   onRetry(retryQueuedIssue);
 
-  // Create webhook app
-  const app = createWebhookApp();
+  const app = createWebhookApp(config);
 
-  // Ensure worker image is ready
   const worker = new DockerWorker();
   setDockerWorker(worker);
   await worker.ensureImage();
-  console.log("[init] Worker ready\n");
+  logger.info("[init] Worker ready");
 
-  // Start ngrok tunnel if token is configured
+  onShutdown(async () => {
+    stopNgrokTunnels();
+  });
+
   let ngrokUrl = "";
   if (config.ngrokAuthToken) {
     try {
       ngrokUrl = await startNgrokTunnel(config.listenPort, config.ngrokAuthToken);
-      console.log(`\n[ngrok] Tunnel: ${ngrokUrl}\n`);
-
-      // Register webhook with GitHub
+      logger.info(`[ngrok] Tunnel: ${ngrokUrl}`);
       await registerWebhook(ngrokUrl, config);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      console.error(`[ngrok] Failed: ${msg}`);
-      console.log("[ngrok] Manual setup: ngrok http 3000");
-      console.log("[ngrok] Then manually register: https://github.com/settings/hooks\n");
+      logger.error(`[ngrok] Failed: ${redact(msg)}`);
+      console.error("[ngrok] Manual setup: ngrok http 3000");
+      console.error("[ngrok] Then manually register: https://github.com/settings/hooks\n");
     }
   } else {
-    console.log("[ngrok] No token configured. Run: ngrok http 3000");
-    console.log("[ngrok] Then manually register: https://github.com/settings/hooks\n");
+    logger.info("[ngrok] No token configured");
   }
 
-  // Start Express server
   const server = app.listen(config.listenPort, () => {
-    console.log(`[server] Webhook listener: http://localhost:${config.listenPort}/webhook`);
-    console.log(`[server] Health check: http://localhost:${config.listenPort}/health`);
+    logger.info(`[server] Listening on port ${config.listenPort}`);
+    console.log(`[server] Webhook: http://localhost:${config.listenPort}/webhook`);
+    console.log(`[server] Health: http://localhost:${config.listenPort}/health`);
     console.log(`[server] Stats: http://localhost:${config.listenPort}/api/stats`);
     console.log(`[server] Activity: http://localhost:${config.listenPort}/api/activity`);
-    console.log("");
     console.log("=== Bot is ready ===");
     if (ngrokUrl) {
       console.log(`Public URL: ${ngrokUrl}/webhook`);
     }
   });
 
-  // Graceful shutdown
   const shutdown = async (signal: string) => {
-    console.log(`\n[shutdown] ${signal} received...`);
+    logger.info(`[shutdown] ${signal} received`, { signal });
     stopNgrokTunnels();
+    for (const hook of shutdownHooks) {
+      try {
+        await hook();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[shutdown] Hook error: ${redact(msg)}`);
+      }
+    }
     await worker.stop();
+
     server.close(() => {
-      console.log("[shutdown] Server closed");
+      logger.info("[shutdown] Server closed");
       process.exit(0);
     });
+
+    setTimeout(() => {
+      logger.error("[shutdown] Forced shutdown after timeout");
+      process.exit(1);
+    }, config.shutdownTimeoutMs);
   };
 
   process.on("SIGINT", () => shutdown("SIGINT"));

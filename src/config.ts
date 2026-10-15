@@ -23,6 +23,10 @@ const configSchema = z.object({
   gitAuthorEmail: z.string().default("luci-github-bot@users.noreply.github.com"),
   botUsername: z.string().optional(),
   apiToken: z.string().optional(),
+  webhookBodyLimit: z.coerce.number().default(1_048_576), // 1 MB
+  rateLimitWindowMs: z.coerce.number().default(60_000), // 60s
+  rateLimitMaxRequests: z.coerce.number().default(100),
+  shutdownTimeoutMs: z.coerce.number().default(30_000), // 30s
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -96,6 +100,10 @@ export function getConfig(): Config {
     gitAuthorName: env.GIT_AUTHOR_NAME ?? "luci-github-bot",
     gitAuthorEmail: env.GIT_AUTHOR_EMAIL ?? "luci-github-bot@users.noreply.github.com",
     apiToken: env.API_TOKEN || undefined,
+    webhookBodyLimit: env.WEBHOOK_BODY_LIMIT ?? "1048576",
+    rateLimitWindowMs: env.RATE_LIMIT_WINDOW_MS ?? "60000",
+    rateLimitMaxRequests: env.RATE_LIMIT_MAX_REQUESTS ?? "100",
+    shutdownTimeoutMs: env.SHUTDOWN_TIMEOUT_MS ?? "30000",
   };
 
   const resolvedRepos = parseMonitoredRepos(raw.monitoredRepos);

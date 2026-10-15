@@ -6,6 +6,8 @@ import { ResourceStats } from "./resource-monitor.js";
 import { metrics } from "./metrics.js";
 import { parseDirectives } from "./directives.js";
 import { loadRepoConfig } from "./repo-config.js";
+import { logger } from "./logger.js";
+import { redact } from "./redact.js";
 import type { JobOptions } from "./types.js";
 
 let dockerWorker: DockerWorker | null = null;
@@ -87,7 +89,6 @@ export function getHealthStats(): HealthStats {
   return stats;
 }
 
-// Issue event payload from GitHub (simplified)
 export interface GitHubIssueEvent {
   action: "opened" | "edited" | "assigned" | "labeled";
   issue: {
@@ -128,20 +129,79 @@ function isGitHubIssueEvent(body: unknown): body is GitHubIssueEvent {
   );
 }
 
-// Webhook handler registry
 type IssueHandler = (event: GitHubIssueEvent) => Promise<void>;
 
 const handlers: IssueHandler[] = [];
+
+const ipRateLimit = new Map<string, { count: number; resetAt: number }>();
 
 export function onIssue(handler: IssueHandler): void {
   handlers.push(handler);
 }
 
-export function createWebhookApp(): express.Express {
-  const app = express();
-  const config = getConfig();
+function rateLimitMiddleware(
+  windowMs: number,
+  maxRequests: number
+): express.RequestHandler {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const ip = req.ip || req.socket.remoteAddress || "unknown";
+    const now = Date.now();
+    let entry = ipRateLimit.get(ip);
 
-  // Parse JSON bodies
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + windowMs };
+      ipRateLimit.set(ip, entry);
+    }
+
+    entry.count++;
+
+    if (entry.count > maxRequests) {
+      logger.warn("[webhook] Rate limited", { ip: redact(ip) });
+      return res.status(429).json({ error: "Rate limit exceeded" });
+    }
+
+    next();
+  };
+}
+
+function authMiddleware(config: ReturnType<typeof getConfig>): express.RequestHandler {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!config.apiToken) {
+      const host = req.headers.host || "localhost";
+      if (!host.includes("127.0.0.1") && !host.includes("localhost")) {
+        logger.warn("[webhook] /api/* accessed remotely without API_TOKEN", { ip: req.ip });
+        return res.status(403).json({ error: "API access denied" });
+      }
+      return next();
+    }
+
+    const auth = req.headers.authorization;
+    if (!auth || auth !== `Bearer ${config.apiToken}`) {
+      logger.warn("[webhook] Unauthorized /api/* access", { path: req.path });
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    next();
+  };
+}
+
+export function createWebhookApp(config?: ReturnType<typeof getConfig>): express.Express {
+  const appConfig = config ?? getConfig();
+  const app = express();
+  const realConfig = getConfig();
+
+  app.use(express.json({
+    limit: appConfig.webhookBodyLimit,
+    verify: (req: Request, _res: Response, buf) => {
+      (req as any).rawBody = buf;
+    },
+  }  ));
+
+  app.use("/webhook", rateLimitMiddleware(
+    realConfig.rateLimitWindowMs,
+    realConfig.rateLimitMaxRequests
+  ));
+
   app.use(express.json({
     verify: (req: Request, _res: Response, buf) => {
       (req as any).rawBody = buf;
@@ -162,45 +222,50 @@ export function createWebhookApp(): express.Express {
         req.headers["x-hub-signature-256"] as string | undefined;
 
       if (!signature) {
-        console.error("[webhook] Missing X-Hub-Signature-256 header");
+        logger.warn("[webhook] Missing X-Hub-Signature-256 header");
         return res.status(400).json({ error: "Missing signature header" });
       }
 
-      // Verify signature
-      const hmac = crypto.createHmac("sha256", config.webhookSecret);
-      const digest = "sha256=" + hmac.update((req as any).rawBody).digest("hex");
+        // Verify signature (handle length mismatch without throwing)
+        const hmac = crypto.createHmac("sha256", appConfig.webhookSecret);
+        const digest = "sha256=" + hmac.update((req as any).rawBody).digest("hex");
+        const sigBuf = Buffer.from(signature);
+        const digBuf = Buffer.from(digest);
+        const sigValid = sigBuf.length === digBuf.length
+          && crypto.timingSafeEqual(sigBuf, digBuf);
 
-      try {
-        if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest))) {
-          console.error("[webhook] Signature verification failed");
-          return res.status(401).json({ error: "Invalid signature" });
-        }
-      } catch (e) {
-        console.error("[webhook] Signature comparison error:", e);
-        return res.status(401).json({ error: "Signature verification failed" });
-      }
+       if (!sigValid) {
+         logger.error("[webhook] Signature verification failed");
+         return res.status(401).json({ error: "Invalid signature" });
+       }
 
       const eventType = req.headers["x-github-event"] as string;
       const deliveryId = req.headers["x-github-delivery"] as string;
 
+      // Reject missing X-GitHub-Event header
+      if (!eventType) {
+        logger.warn("[webhook] Missing X-GitHub-Event header");
+        return res.status(400).json({ error: "Missing X-GitHub-Event header" });
+      }
+
       // Only handle issues events
       if (eventType !== "issues") {
-        console.log(`[webhook] Ignoring event type: ${eventType}`);
+        logger.info("[webhook] Ignoring event type: " + eventType);
         return res.status(200).json({ status: "ignored" });
       }
 
       const body = req.body as unknown;
 
       if (!isGitHubIssueEvent(body)) {
-        console.error("[webhook] Invalid issue event payload");
+        logger.error("[webhook] Invalid issue event payload");
         return res.status(400).json({ error: "Invalid payload" });
       }
 
       const event = body;
 
       // Check if repo is monitored
-      if (!config.monitoredRepos.includes(event.repository.full_name)) {
-        console.log(
+      if (!appConfig.monitoredRepos.includes(event.repository.full_name)) {
+        logger.info(
           `[webhook] Ignoring issue #${event.issue.number} from unmonitored repo: ${event.repository.full_name}`
         );
         return res.status(200).json({ status: "ignored", repo: event.repository.full_name });
@@ -212,13 +277,12 @@ export function createWebhookApp(): express.Express {
           (l) => l.name === "needs-retry"
         );
         if (hasRetryLabel && retryHandler) {
-          console.log(
+          logger.info(
             `[webhook] Retry triggered for issue #${event.issue.number} in ${event.repository.full_name}`
           );
           retryHandler(event).catch((error) => {
-            console.error(
-              `[webhook] Retry handler error for issue #${event.issue.number}:`,
-              error
+            logger.error(
+              `[webhook] Retry handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
             );
           });
           return res.status(200).json({ status: "retry", action: event.action });
@@ -227,8 +291,8 @@ export function createWebhookApp(): express.Express {
 
       if (event.action === "assigned" && event.issue.assignee) {
         // Skip if the bot assigned itself
-        if (event.sender.login === config.botUsername) {
-          console.log(
+        if (event.sender.login === appConfig.botUsername) {
+          logger.info(
             `[webhook] Ignoring self-assignment #${event.issue.number}`
           );
           return res.status(200).json({ status: "ignored" });
@@ -236,7 +300,7 @@ export function createWebhookApp(): express.Express {
 
         // Skip closed issues
         if (event.issue.state === "closed") {
-          console.log(
+          logger.info(
             `[webhook] Ignoring closed issue #${event.issue.number}`
           );
           return res.status(200).json({ status: "ignored" });
@@ -244,7 +308,7 @@ export function createWebhookApp(): express.Express {
 
         // Skip pull requests (issues with pull_request field)
         if (event.issue.pull_request) {
-          console.log(
+          logger.info(
             `[webhook] Ignoring PR #${event.issue.number}`
           );
           return res.status(200).json({ status: "ignored" });
@@ -252,7 +316,7 @@ export function createWebhookApp(): express.Express {
 
         // Skip issues with bot:no-run label
         if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
-          console.log(
+          logger.info(
             `[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`
           );
           return res.status(200).json({ status: "ignored" });
@@ -260,34 +324,34 @@ export function createWebhookApp(): express.Express {
 
         // Skip reassignments from another user to the bot
         if (event.changes?.assignee?.login) {
-          console.log(
+          logger.info(
             `[webhook] Ignoring reassignment #${event.issue.number}`
           );
           return res.status(200).json({ status: "ignored" });
         }
 
         // Check assignee matches bot
-        if (event.issue.assignee.login !== config.botUsername) {
-          console.log(
+        if (event.issue.assignee.login !== appConfig.botUsername) {
+          logger.info(
             `[webhook] Ignoring assign #${event.issue.number} — assigned to ${event.issue.assignee.login}`
           );
           return res.status(200).json({ status: "ignored", assignee: event.issue.assignee.login });
         }
 
-        console.log(
+        logger.info(
           `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
         );
 
         // Parse per-repo config and directives
         const [repoConfigResult, directivesResult] = await Promise.all([
           loadRepoConfig(
-            config.githubToken,
+            appConfig.githubToken,
             event.repository.full_name,
             repoConfigCache,
             REPO_CONFIG_CACHE_TTL_MS
           ),
           checkCollaborator(
-            config.githubToken,
+            appConfig.githubToken,
             event.repository.full_name,
             event.issue.user.login
           ).then((isCollab) =>
@@ -305,9 +369,8 @@ export function createWebhookApp(): express.Express {
           try {
             await handler(event);
           } catch (error) {
-            console.error(
-              `[webhook] Handler error for issue #${event.issue.number}:`,
-              error
+            logger.error(
+              `[webhook] Handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
             );
           }
         });
@@ -318,10 +381,14 @@ export function createWebhookApp(): express.Express {
     })
   );
 
-  // Health check endpoint
+  // Health check endpoint (public, coarse info only)
   app.get("/health", (_req: Request, res: Response) => {
-    res.json(getHealthStats());
+    const stats = getHealthStats();
+    res.json({ status: stats.status, timestamp: stats.timestamp, capacity: stats.capacity });
   });
+
+  // Auth middleware for /api/* routes
+  app.use("/api", authMiddleware(realConfig));
 
   // Stats endpoint
   app.get("/api/stats", (_req: Request, res: Response) => {
