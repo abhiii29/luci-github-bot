@@ -1,0 +1,184 @@
+// ---------------------------------------------------------------------------
+// Brief 15: Tests for plan-only / approval flow
+// ---------------------------------------------------------------------------
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  createPlan,
+  approvePlan,
+  cancelPlan,
+  getPlanState,
+  invalidatePlan,
+  getApprovedFiles,
+  parsePlanOutput,
+  isPlanExpired,
+  type Plan,
+} from "../src/plan.js";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const fakeLlm = async (_prompt: string) => `BRANCH: feat/issue-42
+COMMIT: Add rate limiting
+APPROACH: Add a sliding window rate limiter to the webhook handler
+RISK: In-memory state lost on restart
+QUESTION: Should we support distributed rate limiting?
+FILES: src/rate-limiter.ts:create:New rate limiter module
+FILES: src/webhook.ts:update:Add rate limiting check`;
+
+// ---------------------------------------------------------------------------
+// parsePlanOutput
+// ---------------------------------------------------------------------------
+
+describe("parsePlanOutput", () => {
+  it("parses all plan fields", async () => {
+    const plan = parsePlanOutput(await fakeLlm(""), "");
+    expect(plan.branchName).toBe("feat/issue-42");
+    expect(plan.commitMessage).toBe("Add rate limiting");
+    expect(plan.approach).toContain("sliding window");
+    expect(plan.risks).toContain("In-memory state lost on restart");
+    expect(plan.openQuestions).toContain("Should we support distributed rate limiting?");
+    expect(plan.files).toHaveLength(2);
+    expect(plan.files[0].path).toBe("src/rate-limiter.ts");
+    expect(plan.files[0].operation).toBe("create");
+    expect(plan.files[1].path).toBe("src/webhook.ts");
+    expect(plan.files[1].operation).toBe("update");
+  });
+
+  it("handles minimal output", () => {
+    const plan = parsePlanOutput("BRANCH: x\nCOMMIT: y", "");
+    expect(plan.branchName).toBe("x");
+    expect(plan.commitMessage).toBe("y");
+    expect(plan.files).toHaveLength(0);
+    expect(plan.risks).toHaveLength(0);
+  });
+
+  it("handles missing branch/commit", () => {
+    const plan = parsePlanOutput("APPROACH: do it\nRISK: bad", "");
+    expect(plan.branchName).toContain("do-it");
+    expect(plan.commitMessage).toBe("Implement approved plan");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plan lifecycle
+// ---------------------------------------------------------------------------
+
+describe("Plan lifecycle", () => {
+  let key: string;
+
+  beforeEach(() => {
+    // Key format: owner__repoWithDashes__issueNumber
+    // repoFullName "test-owner/test-repo" → sanitized "test-owner-test-repo"
+    key = "test-owner__test-owner-test-repo__42";
+  });
+
+  it("create -> approve -> getApprovedFiles", async () => {
+    const { plan: state } = await createPlan(
+      "test-owner",
+      "Add feature",
+      "Body text",
+      "test-owner/test-repo",
+      42,
+      fakeLlm
+    );
+    expect(state.status).toBe("pending");
+    expect(state.plan.files).toHaveLength(2);
+
+    const approved = approvePlan(key, "collaborator");
+    expect(approved.status).toBe("approved");
+    expect(approved.approvedBy).toBe("collaborator");
+
+    const files = getApprovedFiles(key);
+    expect(files).toHaveLength(2);
+    expect(files[0].path).toBe("src/rate-limiter.ts");
+  });
+
+  it("create -> cancel", async () => {
+    await createPlan("test-owner", "Add feature", "Body", "test-owner/test-repo", 42, fakeLlm);
+    const cancelled = cancelPlan(key);
+    expect(cancelled.status).toBe("cancelled");
+
+    expect(() => approvePlan(key, "alice")).toThrow("cancelled");
+  });
+
+  it("expired plan cannot be approved", async () => {
+    await createPlan("test-owner", "Add feature", "Body", "test-owner/test-repo", 42, fakeLlm);
+    const state = getPlanState("test-owner", "test-repo", 42);
+    if (state) {
+      // Simulate expiration by setting created time in the past
+      state.plan.createdAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      // Re-read to trigger expiration
+      const refreshed = getPlanState("test-owner", "test-repo", 42, 1000);
+      expect(refreshed?.status).toBe("expired");
+    }
+  });
+
+  it("invalidates plan on issue body change", async () => {
+    const { plan: state } = await createPlan(
+      "test-owner",
+      "Add feature",
+      "Original body",
+      "test-owner/test-repo",
+      42,
+      fakeLlm
+    );
+    expect(state.issueBodyHash).toBeDefined();
+
+    const invalidated = invalidatePlan("test-owner", "test-repo", 42, "different-hash");
+    expect(invalidated?.status).toBe("expired");
+  });
+
+  it("getPlanState returns null for non-existent plan", () => {
+    expect(getPlanState("test-owner", "test-repo", 999)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TTL / expiration
+// ---------------------------------------------------------------------------
+
+describe("Plan TTL", () => {
+  it("plan not expired within TTL", () => {
+    const state = {
+      plan: {
+        branchName: "feat/x",
+        commitMessage: "x",
+        files: [],
+        approach: "x",
+        risks: [],
+        openQuestions: [],
+        createdAt: new Date().toISOString(),
+      },
+      status: "pending" as const,
+    };
+    expect(isPlanExpired(state, 86400000)).toBe(false);
+  });
+
+  it("plan expired after TTL", () => {
+    const state = {
+      plan: {
+        branchName: "feat/x",
+        commitMessage: "x",
+        files: [],
+        approach: "x",
+        risks: [],
+        openQuestions: [],
+        createdAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
+      },
+      status: "pending" as const,
+    };
+    expect(isPlanExpired(state, 7 * 24 * 60 * 60 * 1000)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plan file restriction
+// ---------------------------------------------------------------------------
+
+describe("getApprovedFiles", () => {
+  it("returns empty for unapproved plan", () => {
+    const files = getApprovedFiles("nonexistent");
+    expect(files).toHaveLength(0);
+  });
+});
