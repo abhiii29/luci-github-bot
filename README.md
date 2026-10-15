@@ -141,6 +141,7 @@ This "divide and conquer" approach improves reliability on smaller models.
 | `RATE_LIMIT_MAX_REQUESTS` | Max requests per window | `100` |
 | `SHUTDOWN_TIMEOUT_MS` | Graceful shutdown wait time | `30000` (30s) |
 | `LOG_LEVEL` | Logger level (debug/info/warn/error) | `info` |
+| `DRY_RUN` | Skip push/PR, print solution summary | `false` |
 
 The bot user is auto-detected from the first monitored repo's owner, or overridden via `GITHUB_BOT_USERNAME`.
 
@@ -254,6 +255,23 @@ npm run build:all
 
 # Run tests
 npm test
+
+# Run smoke tests (with mock LLM, no podman/Ollama required)
+cd scripts/smoke
+./run.sh
+```
+
+## Smoke Tests
+
+A repeatable end-to-end smoke test suite is provided in `scripts/smoke/`. It:
+
+- Starts a mock LLM server (`mock-llm.mjs`) that returns fixed responses
+- Starts the bot with `DRY_RUN=1` (no push/PR)
+- Sends 7 webhook fixtures covering: assigned-to-bot, assigned-to-other, wrong-repo, bad-signature, needs-retry, injection payload, and duplicate delivery
+- Asserts HTTP outcomes against `/api/stats`
+- Prints a pass/fail table
+
+See `docs/SMOKE.md` for full instructions.
 ```
 
 ## License

@@ -211,6 +211,18 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
 
     console.log(`[handler] Solution generated: ${solution.files.length} file(s) for branch ${solution.branchName}`);
 
+    // DRY_RUN: skip container execution, print diff instead
+    if (config.dryRun) {
+      console.log(`[handler] DRY_RUN: skipping container execution for ${issueKey}`);
+      await commentOnIssue(
+        githubToken,
+        repoFullName,
+        issueNumber,
+        `⚠️ **luci-github-bot (DRY RUN)** generated a solution but did not push or create a PR.\n\n\`\`\`\nBranch: ${solution.branchName}\nCommit: ${solution.commitMessage}\n\nFiles: ${solution.files.map((f) => `${f.operation}: ${f.path}`).join(", ")}\n\`\`\`\n\nTo execute for real, remove \`DRY_RUN=1\` from your .env and restart the bot.`
+      );
+      return;
+    }
+
     // Process the issue in a Docker container
     const result = await worker.processIssue(event, solution, (progress: WorkerProgress) => {
       console.log(`[handler] ${progress.stage}: ${progress.message}`);

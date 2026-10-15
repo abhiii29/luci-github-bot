@@ -29,6 +29,7 @@ const configSchema = z.object({
   rateLimitWindowMs: z.coerce.number().default(60_000), // 60s
   rateLimitMaxRequests: z.coerce.number().default(100),
   shutdownTimeoutMs: z.coerce.number().default(30_000), // 30s
+  dryRun: z.coerce.boolean().default(false),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -108,6 +109,7 @@ export function getConfig(): Config {
     rateLimitWindowMs: env.RATE_LIMIT_WINDOW_MS ?? "60000",
     rateLimitMaxRequests: env.RATE_LIMIT_MAX_REQUESTS ?? "100",
     shutdownTimeoutMs: env.SHUTDOWN_TIMEOUT_MS ?? "30000",
+    dryRun: env.DRY_RUN === "true" || env.DRY_RUN === "1",
   };
 
   const resolvedRepos = parseMonitoredRepos(raw.monitoredRepos);
