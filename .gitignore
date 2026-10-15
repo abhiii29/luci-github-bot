@@ -4,3 +4,9 @@ dist/
 *.log
 .DS_Store
 *.omo/
+.omo/
+.omo/*
+.omo/*/
+.handoff/
+*.sqlite*
+coverage/
