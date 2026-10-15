@@ -1,5 +1,13 @@
 import OpenAI from "openai";
 import { getConfig, getAdessoApiKey } from "./config.js";
+import {
+  buildSingleShotPrompt,
+  buildDecompositionPrompt,
+  buildExecutionPrompt,
+  buildRepairPrompt,
+  estimateTokenCount,
+  formatPromptSample,
+} from "./prompts.js";
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -32,95 +40,8 @@ export interface DecompositionResult {
 }
 
 // ---------------------------------------------------------------------------
-// Prompts
-// ---------------------------------------------------------------------------
-
-const DECOMPOSITION_SYSTEM_PROMPT = `You are an expert software architect. Your job is to break down GitHub issues into small, focused subtasks that a coding agent can execute independently.
-
-OUTPUT FORMAT (JSON):
-{
-  "branch_name": "fix/issue-123-description",
-  "commit_message": "Fix: concise description of changes",
-  "subtasks": [
-    {
-      "id": "A",
-      "description": "What needs to be done in this subtask (be specific). Include exact code patterns to follow from existing code.",
-      "files": ["src/path/to/file.ts"],
-      "dependencies": []
-    }
-  ],
-  "needs_clarification": null
-}
-
-RULES:
-- Split complex issues into 2-5 independent subtasks
-- Each subtask should modify at most 2-3 files
-- Use dependency arrays to express ordering constraints
-- Prefer independent subtasks (empty dependencies) for parallel execution
-- Prefer splitting changes across multiple files to enable parallel execution
-- Split complex files: extract utilities/types to separate files, keep main file focused
-- Use kebab-case branch names: fix/issue-123-description
-- If the issue needs more information, fill needs_clarification and leave subtasks empty
-- Be specific in descriptions: mention the exact functions, types, or patterns involved`;
-
-const DECOMPOSITION_USER_PROMPT_TEMPLATE = `REPOSITORY: %s
-
-GITHUB ISSUE:
-Title: %s
-Description: %s
-
-Existing files in repo:
-%s
-
-Break this issue into subtasks. Output ONLY valid JSON matching the format above. Do not include markdown fences or explanations.`;
-
-const EXECUTION_SYSTEM_PROMPT = `You are an expert software engineer. You receive a specific subtask and the CURRENT CONTENT of the files to modify.
-
-OUTPUT FORMAT:
-
-BRANCH: <branch-name>
-COMMIT: <concise commit message>
-
-FILE_START: <relative/path/to/file>
-OPERATION: create|update|delete
-<THE COMPLETE NEW FILE CONTENT HERE>
-FILE_END
-
-RULES:
-- Use FILE_START/FILE_END blocks for each file
-- OPERATION must be "create", "update", or "delete"
-- For "create": provide the full new file content
-- For "update": provide the COMPLETE new file content with changes applied (NOT a diff or patch)
-- For "delete": leave the content section empty
-- BRANCH and COMMIT must be on the first two lines
-- Use kebab-case for branch names: fix/issue-123-description
-- ONLY output files listed in the subtask — do NOT modify other files
-- You MUST provide the complete file content, including all imports, types, functions, and logic not being changed
-- Match the EXISTING code style: indentation, naming conventions, patterns, and architecture
-- The file content you see is the CURRENT state of the file — apply only the changes described in the subtask`;
-
-const EXECUTION_USER_PROMPT_TEMPLATE = `REPOSITORY: %s
-
-SUBTASK (ID: %s):
-%s
-
-FILES TO MODIFY:
-%s
-
-%s
-
-Existing files in repo (for reference only):
-%s
-
-Generate code for ONLY the files listed above. Output ONLY the structured response in the exact format specified.`;
-
-// ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
-
-function substituteTemplate(template: string, values: string[]): string {
-  return template.replace(/%s/g, () => values.shift() ?? "");
-}
 
 async function ollamaChat(
   baseUrl: string,
@@ -240,45 +161,8 @@ export async function fetchFileContent(
 }
 
 // ---------------------------------------------------------------------------
-// Single-shot generation for remote models (unchanged)
+// Single-shot generation for remote models (uses prompts.ts builder)
 // ---------------------------------------------------------------------------
-
-const SINGLE_SHOT_SYSTEM_PROMPT = `You are an expert software engineer. You receive a GitHub issue describing a feature, bugfix, or change request.
-
-Your task:
-1. Analyze the issue description and identify what changes are needed.
-2. Determine which files need to be created, modified, or deleted.
-3. Output a structured response with the exact file contents.
-
-OUTPUT FORMAT (strictly follow this format):
-
-BRANCH: <branch-name>
-COMMIT: <concise commit message>
-
-FILE_START: <relative/path/to/file>
-OPERATION: create|update|delete
-<file content here>
-FILE_END
-
-FILE_START: <relative/path/to/another-file>
-OPERATION: update
-<new file content here>
-FILE_END
-
-RULES:
-- Use FILE_START/FILE_END blocks for each file
-- OPERATION must be "create", "update", or "delete"
-- For "create": provide the full new file content
-- For "update": provide the complete new file content (not a diff)
-- For "delete": leave the content section empty
-- Each FILE_START/FILE_END block must be on its own line pair
-- BRANCH and COMMIT must be on the first two lines
-- Use kebab-case for branch names: fix/issue-123-description
-- If the issue is unclear or cannot be implemented as described, output:
-  NEEDS_CLARIFICATION: <specific questions>
-- Keep changes minimal and focused on what the issue asks for
-- Do not modify files not mentioned in the issue
-- Follow existing code conventions in the repository`;
 
 export async function generateSolution(
   issueTitle: string,
@@ -289,26 +173,19 @@ export async function generateSolution(
   const config = getConfig();
   const apiKey = await getAdessoApiKey();
 
+  const prompt = buildSingleShotPrompt(issueTitle, issueBody, repoContext);
+
+  // Add file context to user prompt
   const fileContext = existingFiles
     ? `\nExisting files in repo:\n${existingFiles.map((f) => `  - ${f}`).join("\n")}\n\nFor each file you need to modify, specify the full path as it appears above.`
     : "";
-
-  const prompt = [
-    `REPOSITORY: ${repoContext}`,
-    ``,
-    `GITHUB ISSUE:`,
-    `Title: ${issueTitle}`,
-    `Description: ${issueBody}${fileContext}`,
-    ``,
-    `Generate the code solution now. Output only the structured response in the exact format specified above.`,
-  ].join("\n");
 
   const response = await adessoChat(
     apiKey,
     config.adassoBaseUrl,
     config.adassoModel,
-    SINGLE_SHOT_SYSTEM_PROMPT,
-    prompt,
+    prompt.system,
+    prompt.user + fileContext,
     14000
   );
 
@@ -327,32 +204,30 @@ async function decomposeIssue(
   retryCount: number = 0
 ): Promise<DecompositionResult> {
   const config = getConfig();
-  const fileContextList = existingFiles.map((f) => `  - ${f}`).join("\n");
-
-  const prompt = substituteTemplate(DECOMPOSITION_USER_PROMPT_TEMPLATE, [
-    repoContext,
+  const prompt = buildDecompositionPrompt(
     issueTitle,
     issueBody,
-    fileContextList || "  (none listed)",
-  ]);
+    repoContext,
+    existingFiles
+  );
 
   const content = await ollamaChat(
     config.ollamaBaseUrl,
     config.ollamaModel,
-    DECOMPOSITION_SYSTEM_PROMPT,
-    prompt,
+    prompt.system,
+    prompt.user,
     4000
   );
 
   const result = parseDecompositionResponse(content);
   if (!result.needsClarification || retryCount >= 1) return result;
 
-  const retryPrompt = prompt + "\n\nPrevious attempt failed to produce valid JSON. " +
+  const retryPrompt = prompt.user + "\n\nPrevious attempt failed to produce valid JSON. " +
     "Ensure your output is a single valid JSON object with keys: branch_name, commit_message, subtasks (array), needs_clarification.";
   const retryContent = await ollamaChat(
     config.ollamaBaseUrl,
     config.ollamaModel,
-    DECOMPOSITION_SYSTEM_PROMPT,
+    prompt.system,
     retryPrompt,
     4000
   );
@@ -374,49 +249,32 @@ async function executeSubtask(
 ): Promise<CodeGenerationResult> {
   const config = getConfig();
 
-  const filesList = subtask.files.map((f) => `  - ${f}`).join("\n") || "  (none specified)";
-
-  const fileContexts: string[] = [];
-  for (const filePath of subtask.files) {
-    const content = fileContents[filePath];
-    if (content) {
-      const maxLen = 5000;
-      const truncated = content.length > maxLen
-        ? content.slice(0, maxLen) + `\n// ... (${content.length - maxLen} more chars, truncated to save context)`
-        : content;
-      fileContexts.push(`\n--- CURRENT CONTENT OF ${filePath} ---\n${truncated}`);
-    }
-  }
-  const fileContextBlock = fileContexts.length > 0 ? fileContexts.join("\n\n") : "(No existing content available for these files — treat as new files)";
-
-  const fileContextList = existingFiles.map((f) => `  - ${f}`).join("\n");
-
-  const prompt = substituteTemplate(EXECUTION_USER_PROMPT_TEMPLATE, [
-    repoContext,
-    subtask.id,
-    subtask.description,
-    filesList,
-    fileContextBlock,
-    fileContextList || "  (none listed)",
-  ]);
+  const prompt = buildExecutionPrompt(subtask, repoContext, existingFiles, fileContents);
 
   const content = await ollamaChat(
     config.ollamaBaseUrl,
     config.ollamaModel,
-    EXECUTION_SYSTEM_PROMPT,
-    prompt,
+    prompt.system,
+    prompt.user,
     12000
   );
 
   let result = parseLLMResponse(content);
 
   if (!result.success && retryCount < 1) {
-    const retryPrompt = prompt + "\n\nPrevious attempt failed to parse. Re-output using the exact format: BRANCH on first line, COMMIT on second, then FILE_START/FILE_END blocks.";
+    const repairPrompt = buildRepairPrompt(
+      content,
+      "Could not parse LLM response (missing BRANCH/COMMIT or FILE blocks)",
+      subtask,
+      repoContext,
+      existingFiles,
+      fileContents
+    );
     const retryContent = await ollamaChat(
       config.ollamaBaseUrl,
       config.ollamaModel,
-      EXECUTION_SYSTEM_PROMPT,
-      retryPrompt,
+      repairPrompt.system,
+      repairPrompt.user,
       12000
     );
     result = parseLLMResponse(retryContent);
