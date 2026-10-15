@@ -94,7 +94,7 @@ interface ContainerRuntime {
   create(image: string, env: string[], containerName: string): Promise<{ id: string }>;
   start(containerId: string): Promise<void>;
   logs(containerId: string): Promise<string>;
-  inspect(containerId: string): Promise<{ State: { Running: boolean; ExitCode: number } }>;
+  inspect(containerId: string): Promise<{ Running: boolean; ExitCode: number }>;
   kill(containerId: string): Promise<void>;
   rm(containerId: string): Promise<void>;
   ps(): Promise<Array<{ Id: string; Name: string; Status: string }>>;
@@ -151,7 +151,6 @@ class PodmanRuntime implements ContainerRuntime {
       "create",
       "--name",
       containerName,
-      "--rm",
       ...envArgs,
       image,
     ]);
@@ -160,9 +159,14 @@ class PodmanRuntime implements ContainerRuntime {
   }
 
   async start(containerId: string) {
-    await this.run(["start", "--attachstdout", "--attachstderr", containerId], {
-      timeout: getConfig().workerTimeoutMs,
-    });
+    // Start container in detached mode (no -a), then poll for exit
+    await this.run(["start", containerId]);
+    const deadline = Date.now() + getConfig().workerTimeoutMs;
+    while (Date.now() < deadline) {
+      const state = await this.inspect(containerId);
+      if (!state.Running) break;
+      await new Promise((r) => setTimeout(r, 2_000));
+    }
   }
 
   async logs(containerId: string) {
@@ -176,7 +180,7 @@ class PodmanRuntime implements ContainerRuntime {
       "--format",
       "{{json .State}}",
     ]);
-    return JSON.parse(output) as { State: { Running: boolean; ExitCode: number } };
+    return JSON.parse(output) as { Running: boolean; ExitCode: number };
   }
 
   async kill(containerId: string) {
@@ -255,7 +259,6 @@ class DockerRuntime implements ContainerRuntime {
       "create",
       "--name",
       containerName,
-      "--rm",
       ...envArgs,
       image,
     ]);
@@ -264,9 +267,13 @@ class DockerRuntime implements ContainerRuntime {
   }
 
   async start(containerId: string) {
-    await this.run(["start", "--attachstdout", "--attachstderr", containerId], {
-      timeout: getConfig().workerTimeoutMs,
-    });
+    await this.run(["start", containerId]);
+    const deadline = Date.now() + getConfig().workerTimeoutMs;
+    while (Date.now() < deadline) {
+      const state = await this.inspect(containerId);
+      if (!state.Running) break;
+      await new Promise((r) => setTimeout(r, 2_000));
+    }
   }
 
   async logs(containerId: string) {
@@ -280,7 +287,7 @@ class DockerRuntime implements ContainerRuntime {
       "--format",
       "{{json .State}}",
     ]);
-    return JSON.parse(output) as { State: { Running: boolean; ExitCode: number } };
+    return JSON.parse(output) as { Running: boolean; ExitCode: number };
   }
 
   async kill(containerId: string) {
@@ -324,7 +331,7 @@ export class DockerWorker {
   private imageBuilt = false;
   private readonly imageTag = "luci-github-bot-worker:latest";
   private readonly contextDir = path.join(__dirname, "..");
-  private readonly dockerfilePath = path.join(this.contextDir, "images", "Dockerfile.worker");
+  private readonly dockerfilePath = path.join(this.contextDir, "Dockerfile.worker");
 
   constructor() {
     const config = getConfig();
@@ -489,10 +496,10 @@ export class DockerWorker {
       // Check result
       const state = await this.runtime.inspect(id);
 
-      if (state.State.ExitCode !== 0) {
+      if (state.ExitCode !== 0) {
         const logs = await this.runtime.logs(id);
         const errorLog = logs.slice(-2000);
-        throw new Error(`Worker exited with code ${state.State.ExitCode}: ${errorLog}`);
+        throw new Error(`Worker exited with code ${state.ExitCode}: ${errorLog}`);
       }
 
       onProgress?.({

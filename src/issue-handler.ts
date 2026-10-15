@@ -1,7 +1,8 @@
 import { GitHubIssueEvent, onIssue } from "./webhook.js";
-import { generateSolution } from "./llm.js";
+import { generateSolution, generateSolutionWithDecomposition, isLocalModelTrigger, extractLocalPrompt } from "./llm.js";
 import { DockerWorker, WorkerResult, WorkerProgress, WorkerCapacity } from "./docker-worker.js";
 import { getConfig } from "./config.js";
+import { metrics } from "./metrics.js";
 
 const worker = new DockerWorker();
 
@@ -137,10 +138,15 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
   }
   processingIssues.add(issueKey);
 
+  const startTime = Date.now();
+  metrics.recordIssueReceived(repoFullName, issueNumber);
+  metrics.recordIssueProcessing(repoFullName, issueNumber);
+
   try {
     const cap = worker.getCapacity();
     if (cap.full) {
       console.log(`[handler] ${issueKey} rejected — all ${cap.max} worker slots occupied`);
+      metrics.recordQueue();
       await commentOnIssue(
         githubToken,
         repoFullName,
@@ -165,13 +171,31 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
     // Get repo file list for context
     const existingFiles = await getRepoFileList(githubToken, repoFullName);
 
-    // Generate solution using Qwen
-    const solution = await generateSolution(
-      event.issue.title,
-      event.issue.body || "(no description)",
-      repoFullName,
-      existingFiles
-    );
+    // Generate solution: use decomposition pipeline for local model, single-shot for remote
+    const bodyOrNull = event.issue.body;
+    let solution: Awaited<ReturnType<typeof generateSolution>>;
+    const useLocal = isLocalModelTrigger(event.issue.title, bodyOrNull ?? undefined);
+
+    if (useLocal) {
+      const focusedPrompt = extractLocalPrompt(event.issue.title, bodyOrNull ?? undefined);
+      console.log(`[handler] Using local LLM decomposition pipeline (@local-model detected)`);
+      solution = await generateSolutionWithDecomposition(
+        event.issue.title,
+        focusedPrompt,
+        repoFullName,
+        existingFiles
+      );
+    } else {
+      console.log(`[handler] Using remote LLM (single-shot)`);
+      solution = await generateSolution(
+        event.issue.title,
+        event.issue.body || "(no description)",
+        repoFullName,
+        existingFiles
+      );
+    }
+
+    metrics.recordLlmGeneration(solution.success, useLocal);
 
     if (!solution.success) {
       console.error(`[handler] LLM failed to generate solution: ${solution.error}`);
@@ -192,8 +216,12 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
       console.log(`[handler] ${progress.stage}: ${progress.message}`);
     });
 
+    metrics.recordWorkerExecution(result.success);
+
     if (result.success) {
       console.log(`[handler] PR created for ${issueKey}: ${result.branchName}`);
+      const duration = Date.now() - startTime;
+      metrics.recordIssueCompleted(result.branchName, duration, repoFullName, issueNumber);
       await commentOnIssue(
         githubToken,
         repoFullName,
@@ -203,6 +231,8 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
       await labelIssue(githubToken, repoFullName, issueNumber, "awaiting-review");
     } else {
       console.error(`[handler] Worker failed for ${issueKey}: ${result.error}`);
+      const duration = Date.now() - startTime;
+      metrics.recordIssueFailed(result.error, duration, repoFullName, issueNumber);
       await commentOnIssue(
         githubToken,
         repoFullName,
@@ -214,6 +244,9 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error(`[handler] Unexpected error for ${issueKey}:`, errorMsg);
+
+    const duration = Date.now() - startTime;
+    metrics.recordIssueFailed(errorMsg, duration, repoFullName, issueNumber);
 
     try {
       await commentOnIssue(

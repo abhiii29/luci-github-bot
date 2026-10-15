@@ -3,6 +3,7 @@ import express, { Request, Response, NextFunction } from "express";
 import { getConfig } from "./config.js";
 import { DockerWorker } from "./docker-worker.js";
 import { ResourceStats } from "./resource-monitor.js";
+import { metrics } from "./metrics.js";
 
 let dockerWorker: DockerWorker | null = null;
 type RetryHandler = (event: GitHubIssueEvent) => Promise<void>;
@@ -202,6 +203,17 @@ export function createWebhookApp(): express.Express {
   // Health check endpoint
   app.get("/health", (_req: Request, res: Response) => {
     res.json(getHealthStats());
+  });
+
+  // Stats endpoint
+  app.get("/api/stats", (_req: Request, res: Response) => {
+    res.json(metrics.getSnapshot());
+  });
+
+  // Recent activity endpoint
+  app.get("/api/activity", (req: Request, res: Response) => {
+    const limit = parseInt(req.query.limit as string) || 20;
+    res.json(metrics.getRecentActivity(Math.min(limit, 100)));
   });
 
   return app;

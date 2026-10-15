@@ -189,6 +189,8 @@ async function main() {
   const server = app.listen(config.listenPort, () => {
     console.log(`[server] Webhook listener: http://localhost:${config.listenPort}/webhook`);
     console.log(`[server] Health check: http://localhost:${config.listenPort}/health`);
+    console.log(`[server] Stats: http://localhost:${config.listenPort}/api/stats`);
+    console.log(`[server] Activity: http://localhost:${config.listenPort}/api/activity`);
     console.log("");
     console.log("=== Bot is ready ===");
     if (ngrokUrl) {
