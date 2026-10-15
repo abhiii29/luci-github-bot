@@ -9,6 +9,7 @@ import { DockerWorker, WorkerProgress } from "./docker-worker.js";
 import { getConfig } from "./config.js";
 import { metrics } from "./metrics.js";
 import { GitHubClient, buildStatusComment, redact, type StatusCode } from "./github.js";
+import { buildRepoContext } from "./repo-context.js";
 
 const worker = new DockerWorker();
 const processingIssues = new Set<string>();
@@ -137,6 +138,16 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
 
     console.log(`[handler] Generating solution for ${issueKey}...`);
 
+    // Build repo context for LLM
+    const repoContext = await buildRepoContext(
+      githubToken,
+      repoFullName,
+      event.issue.title,
+      event.issue.body || ""
+    );
+    console.log(`[handler] Loaded ${repoContext.fileCount} file(s) for context`);
+
+    // Generate solution: use decomposition pipeline for local model, single-shot for remote
     const bodyOrNull = event.issue.body;
     let solution: Awaited<ReturnType<typeof generateSolution>>;
     const useLocal = isLocalModelTrigger(event.issue.title, bodyOrNull ?? undefined);
@@ -147,16 +158,16 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
       solution = await generateSolutionWithDecomposition(
         event.issue.title,
         focusedPrompt,
-        repoFullName,
-        await getRepoFileList(githubToken, repoFullName)
+        repoContext.promptSection,
+        [],
+        githubToken
       );
     } else {
       console.log(`[handler] Using remote LLM (single-shot)`);
       solution = await generateSolution(
         event.issue.title,
         event.issue.body || "(no description)",
-        repoFullName,
-        await getRepoFileList(githubToken, repoFullName)
+        repoContext.promptSection
       );
     }
 

@@ -118,6 +118,10 @@ Generate code for ONLY the files listed above. Output ONLY the structured respon
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+function substituteTemplate(template: string, values: string[]): string {
+  return template.replace(/%s/g, () => values.shift() ?? "");
+}
+
 async function ollamaChat(
   baseUrl: string,
   model: string,
@@ -190,19 +194,19 @@ async function adessoChat(
 // @local-model detection
 // ---------------------------------------------------------------------------
 
-const LOCAL_MODEL_TRIGGER = /^@local-model\s+(.+)/m;
+const LOCAL_MODEL_TRIGGER = /^@local-model\s+/m;
 
 export function isLocalModelTrigger(issueTitle: string, issueBody?: string): boolean {
   return (
-    LOCAL_MODEL_TRIGGER.test(issueTitle) ||
-    (issueBody !== undefined && LOCAL_MODEL_TRIGGER.test(issueBody))
+    /^(?=@local-model\s)/m.test(issueTitle) ||
+    (issueBody !== undefined && /^(?=@local-model\s)/m.test(issueBody))
   );
 }
 
 export function extractLocalPrompt(issueTitle: string, issueBody?: string): string {
-  const combined = `[TITLE]\n${issueTitle}\n\n[BODY]\n${issueBody ?? "(no description)"}`;
+  const combined = `${issueTitle}\n${issueBody ?? "(no description)"}`;
   const match = combined.match(LOCAL_MODEL_TRIGGER);
-  if (match) return match[1].trim();
+  if (match) return combined.slice(match.index! + match[0].length).trim();
   return issueBody ?? "(no description)";
 }
 
@@ -213,10 +217,13 @@ export function extractLocalPrompt(issueTitle: string, issueBody?: string): stri
 export async function fetchFileContent(
   githubToken: string,
   repoFullName: string,
-  filePath: string
+  filePath: string,
+  ref?: string
 ): Promise<string | null> {
   try {
-    const url = `https://api.github.com/repos/${repoFullName}/contents/${encodeURIComponent(filePath)}`;
+    const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
+    const refParam = ref ? `&ref=${encodeURIComponent(ref)}` : "";
+    const url = `https://api.github.com/repos/${repoFullName}/contents/${encodedPath}${refParam}`;
     const res = await fetch(url, {
       headers: {
         Authorization: `Bearer ${githubToken}`,
@@ -286,15 +293,15 @@ export async function generateSolution(
     ? `\nExisting files in repo:\n${existingFiles.map((f) => `  - ${f}`).join("\n")}\n\nFor each file you need to modify, specify the full path as it appears above.`
     : "";
 
-  const prompt = `${SINGLE_SHOT_SYSTEM_PROMPT}
-
-REPOSITORY: ${repoContext}
-
-GITHUB ISSUE:
-Title: ${issueTitle}
-Description: ${issueBody}${fileContext}
-
-Generate the code solution now. Output only the structured response in the exact format specified above.`;
+  const prompt = [
+    `REPOSITORY: ${repoContext}`,
+    ``,
+    `GITHUB ISSUE:`,
+    `Title: ${issueTitle}`,
+    `Description: ${issueBody}${fileContext}`,
+    ``,
+    `Generate the code solution now. Output only the structured response in the exact format specified above.`,
+  ].join("\n");
 
   const response = await adessoChat(
     apiKey,
@@ -316,15 +323,18 @@ async function decomposeIssue(
   issueTitle: string,
   issueBody: string,
   repoContext: string,
-  existingFiles: string[]
+  existingFiles: string[],
+  retryCount: number = 0
 ): Promise<DecompositionResult> {
   const config = getConfig();
   const fileContextList = existingFiles.map((f) => `  - ${f}`).join("\n");
 
-  const prompt = DECOMPOSITION_USER_PROMPT_TEMPLATE.replace("%s", repoContext)
-    .replace("%s", issueTitle)
-    .replace("%s", issueBody)
-    .replace("%s", fileContextList || "  (none listed)");
+  const prompt = substituteTemplate(DECOMPOSITION_USER_PROMPT_TEMPLATE, [
+    repoContext,
+    issueTitle,
+    issueBody,
+    fileContextList || "  (none listed)",
+  ]);
 
   const content = await ollamaChat(
     config.ollamaBaseUrl,
@@ -334,7 +344,19 @@ async function decomposeIssue(
     4000
   );
 
-  return parseDecompositionResponse(content);
+  const result = parseDecompositionResponse(content);
+  if (!result.needsClarification || retryCount >= 1) return result;
+
+  const retryPrompt = prompt + "\n\nPrevious attempt failed to produce valid JSON. " +
+    "Ensure your output is a single valid JSON object with keys: branch_name, commit_message, subtasks (array), needs_clarification.";
+  const retryContent = await ollamaChat(
+    config.ollamaBaseUrl,
+    config.ollamaModel,
+    DECOMPOSITION_SYSTEM_PROMPT,
+    retryPrompt,
+    4000
+  );
+  return parseDecompositionResponse(retryContent);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +369,8 @@ async function executeSubtask(
   existingFiles: string[],
   branchName: string,
   _githubToken: string | undefined,
-  fileContents: Record<string, string>
+  fileContents: Record<string, string>,
+  retryCount: number = 0
 ): Promise<CodeGenerationResult> {
   const config = getConfig();
 
@@ -368,12 +391,14 @@ async function executeSubtask(
 
   const fileContextList = existingFiles.map((f) => `  - ${f}`).join("\n");
 
-  const prompt = EXECUTION_USER_PROMPT_TEMPLATE.replace("%s", repoContext)
-    .replace("%s", subtask.id)
-    .replace("%s", subtask.description)
-    .replace("%s", filesList)
-    .replace("%s", fileContextBlock)
-    .replace("%s", fileContextList || "  (none listed)");
+  const prompt = substituteTemplate(EXECUTION_USER_PROMPT_TEMPLATE, [
+    repoContext,
+    subtask.id,
+    subtask.description,
+    filesList,
+    fileContextBlock,
+    fileContextList || "  (none listed)",
+  ]);
 
   const content = await ollamaChat(
     config.ollamaBaseUrl,
@@ -383,7 +408,19 @@ async function executeSubtask(
     12000
   );
 
-  const result = parseLLMResponse(content);
+  let result = parseLLMResponse(content);
+
+  if (!result.success && retryCount < 1) {
+    const retryPrompt = prompt + "\n\nPrevious attempt failed to parse. Re-output using the exact format: BRANCH on first line, COMMIT on second, then FILE_START/FILE_END blocks.";
+    const retryContent = await ollamaChat(
+      config.ollamaBaseUrl,
+      config.ollamaModel,
+      EXECUTION_SYSTEM_PROMPT,
+      retryPrompt,
+      12000
+    );
+    result = parseLLMResponse(retryContent);
+  }
 
   if (!result.success) {
     return {
@@ -492,7 +529,7 @@ export async function generateSolutionWithDecomposition(
 
     if (ready.length === 0) {
       for (const st of remaining) {
-        const result = await executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents);
+        const result = await executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, 0);
         executed.push(result);
         resolved.add(st.id);
       }
@@ -500,7 +537,7 @@ export async function generateSolutionWithDecomposition(
     }
 
     console.log(`[llm] Phase 2: Executing ${ready.length} subtask(s) in parallel...`);
-    const tasks = ready.map((st) => executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents));
+    const tasks = ready.map((st) => executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, 0));
     const batchResults = await Promise.all(tasks);
     executed.push(...batchResults);
 
