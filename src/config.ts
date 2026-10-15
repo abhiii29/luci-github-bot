@@ -22,6 +22,9 @@ const configSchema = z.object({
   gitAuthorName: z.string().default("luci-github-bot"),
   gitAuthorEmail: z.string().default("luci-github-bot@users.noreply.github.com"),
   botUsername: z.string().optional(),
+  containerMemory: z.string().optional(),
+  containerCpus: z.coerce.number().optional(),
+  containerPidsLimit: z.coerce.number().optional(),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -94,6 +97,9 @@ export function getConfig(): Config {
     resourceCheckIntervalMs: env.RESOURCE_CHECK_INTERVAL_MS ?? "10000",
     gitAuthorName: env.GIT_AUTHOR_NAME ?? "luci-github-bot",
     gitAuthorEmail: env.GIT_AUTHOR_EMAIL ?? "luci-github-bot@users.noreply.github.com",
+    containerMemory: env.CONTAINER_MEMORY,
+    containerCpus: env.CONTAINER_CPUS,
+    containerPidsLimit: env.CONTAINER_PIDS_LIMIT,
   };
 
   const resolvedRepos = parseMonitoredRepos(raw.monitoredRepos);

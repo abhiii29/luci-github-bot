@@ -8,40 +8,70 @@ echo "Branch: $BRANCH_NAME"
 echo "Commit: $COMMIT_MESSAGE"
 echo "Start time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# Configure git and prepare authentication for all git/HTTP operations
+# ---------------------------------------------------------------------------
+# Authentication: use http.extraheader so the token never appears in URLs,
+# git credentials files, or process listings.
+# ---------------------------------------------------------------------------
 export GIT_TERMINAL_PROMPT=0
+
+# Set up a credentials helper that writes the token via a script,
+# avoiding storage on disk.
+export GIT_ASKPASS=/tmp/.git-askpass.sh
+cat > "$GIT_ASKPASS" << 'ASKEOF'
+#!/bin/bash
+echo "${GITHUB_TOKEN}"
+ASKEOF
+chmod +x "$GIT_ASKPASS"
+
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
 git config --global user.email "luci-github-bot@users.noreply.github.com"
 git config --global user.name "luci-github-bot"
-git config --global credential.helper 'store --file=/tmp/.git-credentials'
-echo "https://${GITHUB_TOKEN}@github.com" > /tmp/.git-credentials
-chmod 600 /tmp/.git-credentials
 
-# Clone the repository (use token in URL for authenticated cloning)
+# ---------------------------------------------------------------------------
+# Clone the repository (token injected via http.extraheader, not URL)
+# ---------------------------------------------------------------------------
 echo "--- Cloning repository ---"
-REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_FULL_NAME}.git"
 REPO_NAME=$(basename "$REPO_FULL_NAME")
-echo "Cloning ${REPO_FULL_NAME}..."
-git clone "$REPO_URL" "$REPO_NAME"
+
+git clone \
+  -c http.extraHeader="Authorization: Bearer ${GITHUB_TOKEN}" \
+  "https://github.com/${REPO_FULL_NAME}.git" \
+  "$REPO_NAME"
 echo "Clone complete"
 cd "$REPO_NAME"
 
+# ---------------------------------------------------------------------------
+# Detect the default branch instead of hardcoding "main"
+# ---------------------------------------------------------------------------
+DEFAULT_BRANCH=$(git remote show origin 2>/dev/null \
+  | grep "HEAD branch" \
+  | awk '{print $NF}' \
+  || echo "main")
+echo "Default branch: ${DEFAULT_BRANCH}"
+
+# ---------------------------------------------------------------------------
 # Create a new branch
-git checkout -b "$BRANCH_NAME"
+# ---------------------------------------------------------------------------
+git checkout -b "${BRANCH_NAME}" "${DEFAULT_BRANCH}"
 
-# Parse and apply the code solution
+# ---------------------------------------------------------------------------
+# Parse and apply the code solution (mounted as read-only JSON file)
+# ---------------------------------------------------------------------------
 echo "--- Applying code changes ---"
-SOLUTION="$CODE_SOLUTION"
+SOLUTION_FILE="${SOLUTION_FILE:-/tmp/.luci-solution.json}"
 
-# Extract files from the JSON solution using node (since we're in a node:slim container)
-# The solution is passed as an environment variable as JSON
-
-# Use node to parse and write files
 node -e '
-const solution = JSON.parse(process.env.CODE_SOLUTION);
 const fs = require("fs");
 const path = require("path");
+
+let solution;
+try {
+  solution = JSON.parse(fs.readFileSync(process.env.SOLUTION_FILE, "utf-8"));
+} catch (err) {
+  console.error("Failed to parse solution file:", err.message);
+  process.exit(1);
+}
 
 if (!solution.files || solution.files.length === 0) {
   console.error("No files in solution to apply");
@@ -69,76 +99,98 @@ for (const file of solution.files) {
 console.log("Applied " + solution.files.length + " file(s)");
 '
 
+# ---------------------------------------------------------------------------
 # Check if there are any changes
+# ---------------------------------------------------------------------------
 CHANGED=$(git status --porcelain)
 if [ -z "$CHANGED" ]; then
-  echo "No changes detected. Cancelling PR."
+  echo "RESULT: {\"status\":\"no_changes\"}"
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
 # Commit changes
+# ---------------------------------------------------------------------------
 echo "--- Committing changes ---"
 git add -A
-git commit -m "$COMMIT_MESSAGE"
+git commit -m "${COMMIT_MESSAGE}"
 
-# Push the branch
+# ---------------------------------------------------------------------------
+# Push the branch (no --force)
+# ---------------------------------------------------------------------------
 echo "--- Pushing branch ---"
-git remote set-url origin "https://x-access-token:$GITHUB_TOKEN@github.com/$REPO_FULL_NAME.git"
-git push origin "$BRANCH_NAME" --force
+git push origin "${BRANCH_NAME}" \
+  -c http.extraHeader="Authorization: Bearer ${GITHUB_TOKEN}" \
+  --no-force
 
-# Create a Pull Request
+# ---------------------------------------------------------------------------
+# Create a Pull Request using node to build safe JSON (no shell interpolation)
+# ---------------------------------------------------------------------------
 echo "--- Creating Pull Request ---"
-PR_TITLE="Automated fix: $COMMIT_MESSAGE"
-PR_BODY=$(cat <<EOF
-Automated pull request generated by luci-github-bot
 
-**Related Issue:** #${ISSUE_NUMBER}
-**Source Issue:** https://github.com/$REPO_FULL_NAME/issues/${ISSUE_NUMBER}
+node -e '
+const https = require("https");
+const fs = require("fs");
 
----
+const repoFullName = process.env.REPO_FULL_NAME;
+const issueNumber = process.env.ISSUE_NUMBER;
+const branchName = process.env.BRANCH_NAME;
+const commitMessage = process.env.COMMIT_MESSAGE;
+const token = process.env.GITHUB_TOKEN;
 
-### Description
-This PR addresses the issue: $COMMIT_MESSAGE
+const payload = JSON.stringify({
+  title: "Automated fix: " + commitMessage,
+  body: "Automated pull request generated by luci-github-bot\n\n" +
+        "**Related Issue:** #" + issueNumber + "\n" +
+        "**Source Issue:** https://github.com/" + repoFullName + "/issues/" + issueNumber + "\n\n" +
+        "---\n\n" +
+        "### Description\n" +
+        "This PR addresses the issue: " + commitMessage + "\n\n" +
+        "### Generated by\n" +
+        "luci-github-bot (automated AI assistant)\n\n" +
+        "Please review and merge if the changes look correct.",
+  head: branchName,
+  base: process.env.DEFAULT_BRANCH || "main",
+});
 
-### Changes
-- ${FILES_COUNT:-Multiple files modified/created}
+const options = {
+  hostname: "api.github.com",
+  path: "/repos/" + repoFullName + "/pulls",
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer " + token,
+    "Accept": "application/vnd.github.v3+json",
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+  },
+};
 
-### Generated by
-luci-github-bot (automated AI assistant)
+const req = https.request(options, (res) => {
+  let data = "";
+  res.on("data", (chunk) => { data += chunk; });
+  res.on("end", () => {
+    if (res.statusCode === 201) {
+      const json = JSON.parse(data);
+      console.log("RESULT: {\"status\":\"pr_created\",\"url\":\"" + json.html_url + "\"}");
+    } else if (res.statusCode === 422) {
+      console.log("RESULT: {\"status\":\"pr_exists\"}");
+    } else {
+      console.error("PR creation failed (status: " + res.statusCode + "): " + data.slice(0, 500));
+      console.log("RESULT: {\"status\":\"error\",\"http_status\":" + res.statusCode + "}");
+      process.exit(1);
+    }
+  });
+});
 
-Please review and merge if the changes look correct.
-EOF
-)
+req.on("error", (err) => {
+  console.error("Request error:", err.message);
+  console.log("RESULT: {\"status\":\"error\",\"error\":\"" + err.message.replace(/"/g, "\\\"") + "\"}");
+  process.exit(1);
+});
 
-# Create PR using GitHub API
-echo "Creating pull request..."
-PR_URL=""
-# Write payload to file to handle multiline body properly
-cat > /tmp/pr_payload <<PAYLOAD
-{"title":"Automated fix: $COMMIT_MESSAGE","body":"Automated pull request generated by luci-github-bot\n\n**Related Issue:** #${ISSUE_NUMBER}\n**Source Issue:** https://github.com/$REPO_FULL_NAME/issues/${ISSUE_NUMBER}\n\n---\n\n### Description\nThis PR addresses the issue: $COMMIT_MESSAGE\n\n### Changes\n- ${FILES_COUNT:-Multiple files modified/created}\n\n### Generated by\nluci-github-bot (automated AI assistant)\n\nPlease review and merge if the changes look correct.","head":"$BRANCH_NAME","base":"main"}
-PAYLOAD
-PR_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github.v3+json" \
-  -H "Content-Type: application/json" \
-  -d @/tmp/pr_payload \
-  "https://api.github.com/repos/$REPO_FULL_NAME/pulls" 2>&1)
-PR_HTTP=$(echo "$PR_RESPONSE" | tail -1)
-PR_JSON=$(echo "$PR_RESPONSE" | sed '$d')
-echo "PR response: $PR_JSON (status: $PR_HTTP)"
-if [ "$PR_HTTP" = "201" ]; then
-  PR_URL=$(echo "$PR_JSON" | grep -o '"html_url":"[^"]*"' | cut -d'"' -f4)
-  echo "PR created: $PR_URL"
-elif [ "$PR_HTTP" = "422" ]; then
-  echo "PR may already exist"
-  PR_URL="https://github.com/$REPO_FULL_NAME/pull/new/$BRANCH_NAME"
-else
-  echo "PR creation failed (status: $PR_HTTP)"
-  cat /tmp/pr_payload >&2
-fi
+req.write(payload);
+req.end();
+' || exit 1
 
-echo "Worker completed successfully for #${ISSUE_NUMBER}"
-
-echo ""
-echo "=== Worker completed ==="
+echo "Worker completed for #${ISSUE_NUMBER}"
 echo "End time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
