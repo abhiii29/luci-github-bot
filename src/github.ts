@@ -295,6 +295,39 @@ export class GitHubClient {
     };
   }
 
+  async updateIssue(repo: string, issueNumber: number, patch: { body?: string; state?: "open" | "closed" }): Promise<void> {
+    const res = await this.fetchWithRetry(`https://api.github.com/repos/${repo}/issues/${issueNumber}`, {
+      method: "PATCH",
+      headers: this.jsonHeaders(),
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) {
+      const bodyText = await safeBody(res);
+      throw Object.assign(
+        new Error(`updateIssue ${res.status}: ${redactError(bodyText)}`),
+        { status: res.status, retries: 0 } as ClientError
+      );
+    }
+  }
+
+  /** Newest issue (open or closed) with exactly this title, created by `creator`. */
+  async findIssueByTitle(repo: string, title: string, creator: string): Promise<{ number: number; body: string } | undefined> {
+    const res = await this.fetchWithRetry(
+      `https://api.github.com/repos/${repo}/issues?state=all&creator=${encodeURIComponent(creator)}&per_page=100`,
+      { headers: this.headers() }
+    );
+    if (!res.ok) {
+      const bodyText = await safeBody(res);
+      throw Object.assign(
+        new Error(`findIssueByTitle ${res.status}: ${redactError(bodyText)}`),
+        { status: res.status, retries: 0 } as ClientError
+      );
+    }
+    const data = (await res.json()) as Array<{ number: number; title: string; body: string | null; pull_request?: unknown }>;
+    const hit = data.find((i) => !i.pull_request && i.title === title);
+    return hit ? { number: hit.number, body: hit.body ?? "" } : undefined;
+  }
+
   async addAssignees(repo: string, issueNumber: number, logins: string[]): Promise<void> {
     const res = await this.fetchWithRetry(`https://api.github.com/repos/${repo}/issues/${issueNumber}/assignees`, {
       method: "POST",
@@ -360,6 +393,7 @@ async function safeBody(res: Response): Promise<string> {
 export type StatusStage =
   | "queued"
   | "working"
+  | "retrying"
   | "pr-opened"
   | "branch-pushed"
   | "plan-pending"
@@ -383,7 +417,10 @@ export function buildStatusComment(
       text += "⏳ **Queued** — waiting for a worker slot.";
       break;
     case "working":
-      text += "🔨 **Working** — generating a solution.";
+      text += `🔨 **Working** — ${hint ? clean(hint) : "generating a solution"}.`;
+      break;
+    case "retrying":
+      text += `⏳ **Model unreachable** — retrying at ${hint ?? "a later time"} UTC.`;
       break;
     case "pr-opened":
       text += prUrl ? `✅ **PR opened!** [View PR](${prUrl})` : "✅ **PR opened!**";
