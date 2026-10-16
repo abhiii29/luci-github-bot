@@ -4,6 +4,15 @@ export interface RepoFile {
   size?: number;
 }
 
+export interface RepoContext {
+  promptSection: string;
+  fileCount: number;
+  /** Files whose content was cut to fit the budget: the model never saw all of them. */
+  truncatedPaths: string[];
+  /** Full current content of every file that was shown to the model. */
+  fullContents: Record<string, string>;
+}
+
 export interface SelectedFile {
   path: string;
   content: string;
@@ -111,7 +120,7 @@ export async function buildRepoContext(
     maxFiles?: number;
     perFileBudget?: number;
   }
-): Promise<{ promptSection: string; fileCount: number }> {
+): Promise<RepoContext> {
   const {
     charBudget = DEFAULT_CHAR_BUDGET,
     maxFiles = DEFAULT_MAX_FILES,
@@ -146,7 +155,7 @@ export async function buildRepoContext(
       });
       if (res.ok) treeData = await res.json();
     } catch {
-      return { promptSection: "", fileCount: 0 };
+      return { promptSection: "", fileCount: 0, truncatedPaths: [], fullContents: {} };
     }
   }
 
@@ -165,6 +174,8 @@ export async function buildRepoContext(
 
   // Fetch content for selected files within budget
   const selectedFiles: SelectedFile[] = [];
+  const truncatedPaths: string[] = [];
+  const fullContents: Record<string, string> = {};
   let totalChars = 0;
 
   for (const filePath of selected) {
@@ -180,17 +191,20 @@ export async function buildRepoContext(
         : content;
 
     totalChars += truncated.length;
+    fullContents[filePath] = content;
+    if (truncated !== content) truncatedPaths.push(filePath);
     selectedFiles.push({ path: filePath, content: truncated });
   }
 
   if (selectedFiles.length === 0) {
-    return { promptSection: "", fileCount: 0 };
+    return { promptSection: "", fileCount: 0, truncatedPaths: [], fullContents: {} };
   }
 
   let promptSection = "Relevant repository context:\n\n";
   for (const sf of selectedFiles) {
-    promptSection += `--- FILE: ${sf.path} ---\n${sf.content}\n\n`;
+    const note = truncatedPaths.includes(sf.path) ? " (TRUNCATED — change it only with OPERATION: patch)" : "";
+    promptSection += `--- FILE: ${sf.path}${note} ---\n${sf.content}\n\n`;
   }
 
-  return { promptSection, fileCount: selectedFiles.length };
+  return { promptSection, fileCount: selectedFiles.length, truncatedPaths, fullContents };
 }

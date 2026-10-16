@@ -93,7 +93,7 @@ BRANCH: <branch-name>
 COMMIT: <concise commit message>
 
 FILE_START: <relative/path/to/file>
-OPERATION: create|update|delete
+OPERATION: create|update|delete|patch
 <file content here>
 FILE_END
 
@@ -101,8 +101,16 @@ RULES:
 - Use FILE_START/FILE_END blocks for each file
 - OPERATION must be "create", "update", or "delete"
 - For "create": provide the full new file content
-- For "update": provide the complete new file content (not a diff)
+- For "update": provide the complete new file content (not a diff) — only for files you saw in full
 - For "delete": leave the content section empty
+- For "patch": instead of file content, give one or more exact search/replace blocks:
+  <<<<<<< SEARCH
+  lines copied exactly from the current file (enough to be unique)
+  =======
+  the replacement lines
+  >>>>>>> REPLACE
+- Files marked TRUNCATED were not shown in full: you MUST use "patch" for them, never "update"
+- Prefer "patch" for small changes to large files; never drop code you were not asked to remove
 - BRANCH and COMMIT must be on the first two lines
 - Use kebab-case for branch names: fix/issue-123-description
 - If the issue is unclear or cannot be implemented as described, output:
@@ -263,7 +271,7 @@ export function buildExecutionPrompt(
       const truncated =
         content.length > maxLen
           ? content.slice(0, maxLen) +
-            `\n// ... (${content.length - maxLen} more chars)`
+            `\n// ... TRUNCATED (${content.length - maxLen} more chars): use OPERATION: patch for this file`
           : content;
       fileContexts.push(
         `\n--- CURRENT CONTENT OF ${filePath} (${delimiter}) ---\n${escapeInBlock(truncated, delimiter)}`
@@ -287,12 +295,20 @@ BRANCH: <branch-name>
 COMMIT: <commit message>
 
 FILE_START: <path>
-OPERATION: create|update|delete
+OPERATION: create|update|delete|patch
 <complete file content>
 FILE_END
 
+For a TRUNCATED file use OPERATION: patch with exact search/replace blocks instead of content:
+<<<<<<< SEARCH
+exact current lines
+=======
+new lines
+>>>>>>> REPLACE
+
 RULES:
-- Provide COMPLETE file content (not diffs)
+- "update": COMPLETE file content (not diffs), only for files shown in full
+- "patch": for TRUNCATED files; never rewrite a file you did not see in full
 - Match existing code style exactly
 - Do NOT modify files not listed in the subtask
 - Do NOT include placeholder bodies (// TODO, etc.)

@@ -97,37 +97,11 @@ export class ResourceMonitor {
 
   private async getMemoryPressure(): Promise<number> {
     try {
-      // Get total memory
       const { stdout: memSize } = await execFileAsync("sysctl", ["hw.memsize"]);
       const totalBytes = parseInt(memSize.match(/:\s*(\d+)/)?.[1] ?? "0");
       if (totalBytes === 0) return 0;
-
-      // Get memory pages
       const { stdout: vmStat } = await execFileAsync("vm_stat");
-      const pageBytes = 4096;
-
-      // Parse vm_stat: pages free, active, inactive, wired
-      const lines = vmStat.split("\n");
-      let activePages = 0;
-      let wiredPages = 0;
-      let usedPages = 0;
-
-      for (const line of lines) {
-        const clean = line.trim().replace(/pages\s*[\w\s]*:/, "").trim();
-        const pages = parseInt(clean) || 0;
-
-        if (line.includes("Pages active")) activePages = pages;
-        if (line.includes("Pages wired")) wiredPages = pages;
-        if (line.includes("Pages free")) {
-          // Memory used = total - free
-          const totalPages = totalBytes / pageBytes;
-          usedPages = totalPages - pages;
-        }
-      }
-
-      // Memory pressure = (active + wired) / total — these are the "hard to reclaim" pages
-      const pressure = ((activePages + wiredPages) / (totalBytes / pageBytes)) * 100;
-      return Math.min(100, Math.max(0, pressure));
+      return parseVmStatPressure(vmStat, totalBytes);
     } catch {
       return 0;
     }
@@ -145,4 +119,19 @@ export class ResourceMonitor {
     // Clamp to 0-1
     return Math.max(0, Math.min(1, capacity));
   }
+}
+
+/**
+ * Memory pressure (%) from `vm_stat`: active + wired + compressed pages over total memory.
+ * Page size comes from the header (16 KB on Apple Silicon, 4 KB on Intel).
+ */
+export function parseVmStatPressure(vmStat: string, totalBytes: number): number {
+  const pageBytes = parseInt(vmStat.match(/page size of (\d+) bytes/)?.[1] ?? "4096");
+  const pages = (label: RegExp) => {
+    const m = vmStat.split("\n").find((l) => label.test(l))?.match(/:\s*(\d+)/);
+    return m ? parseInt(m[1]) : 0;
+  };
+  const used = pages(/^Pages active:/) + pages(/^Pages wired down:/) + pages(/^Pages occupied by compressor:/);
+  const pressure = ((used * pageBytes) / totalBytes) * 100;
+  return Math.min(100, Math.max(0, pressure));
 }

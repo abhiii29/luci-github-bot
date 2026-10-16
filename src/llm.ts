@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { applyPatch } from "./patch.js";
 import { getConfig, getAdessoApiKey } from "./config.js";
 import {
   buildSingleShotPrompt,
@@ -16,7 +17,7 @@ import {
 
 export interface CodeGenerationResult {
   success: boolean;
-  files: Array<{ path: string; content: string; operation: "create" | "update" | "delete" }>;
+  files: Array<{ path: string; content: string; operation: "create" | "update" | "delete" | "patch" }>;
   branchName: string;
   commitMessage: string;
   error?: string;
@@ -590,6 +591,19 @@ export async function generateSolutionWithDecomposition(
       // Later subtasks build on what earlier ones wrote
       for (const r of results) {
         for (const f of r.files) {
+          if (f.operation === "patch") {
+            // Apply against the full content we hold, so later subtasks (and the bot) see a whole file
+            const current = fileContents[f.path];
+            const applied = current !== undefined ? applyPatch(current, f.content) : null;
+            if (applied?.ok) {
+              f.operation = "update";
+              f.content = applied.content;
+            } else {
+              r.success = false;
+              r.error = `patch for ${f.path} failed: ${applied ? applied.error : "file content unavailable"}`;
+              continue;
+            }
+          }
           if (f.operation === "delete") delete fileContents[f.path];
           else fileContents[f.path] = f.content;
         }
@@ -651,7 +665,7 @@ export function parseLLMResponse(content: string): CodeGenerationResult {
   }
 
   const fileRegex =
-    /FILE_START:\s*(.+?)\s*\n(OPERATION:\s*(create|update|delete)\s*\n)?([\s\S]*?)(?=\nFILE_START:|\nFILE_END|\n\nFILE_END|$)/g;
+    /FILE_START:\s*(.+?)\s*\n(OPERATION:\s*(create|update|delete|patch)\s*\n)?([\s\S]*?)(?=\nFILE_START:|\nFILE_END|\n\nFILE_END|$)/g;
 
   const files: CodeGenerationResult["files"] = [];
   const seenPaths = new Set<string>();
@@ -659,10 +673,10 @@ export function parseLLMResponse(content: string): CodeGenerationResult {
   let match: RegExpExecArray | null;
   while ((match = fileRegex.exec(content)) !== null) {
     const path = match[1].trim();
-    const operation = (match[3]?.trim() ?? "create") as "create" | "update" | "delete";
+    const operation = (match[3]?.trim() ?? "create") as "create" | "update" | "delete" | "patch";
     const fileContent = match[4]?.trimEnd() ?? "";
 
-    if (operation !== "create" && operation !== "update" && operation !== "delete") {
+    if (operation !== "create" && operation !== "update" && operation !== "delete" && operation !== "patch") {
       continue;
     }
 
@@ -723,7 +737,7 @@ function parseLLMResponseFallback(content: string): CodeGenerationResult {
   const files: CodeGenerationResult["files"] = [];
   let currentFile: {
     path: string;
-    operation: "create" | "update" | "delete";
+    operation: "create" | "update" | "delete" | "patch";
     content: string;
   } | null = null;
 
@@ -744,8 +758,8 @@ function parseLLMResponseFallback(content: string): CodeGenerationResult {
       continue;
     }
     if (currentFile && line.startsWith("OPERATION: ")) {
-      const op = line.slice(11).trim() as "create" | "update" | "delete";
-      if (op === "create" || op === "update" || op === "delete") {
+      const op = line.slice(11).trim() as "create" | "update" | "delete" | "patch";
+      if (op === "create" || op === "update" || op === "delete" || op === "patch") {
         currentFile.operation = op;
       }
       continue;

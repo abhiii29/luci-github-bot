@@ -9,6 +9,8 @@ export interface JobOutcome {
   noOp?: boolean;
   /** false = do not retry (bad input, refusal, validation). Default: retry until maxAttempts. */
   retryable?: boolean;
+  /** Wait at least this long before the retry (e.g. the model endpoint is down). */
+  retryDelayMs?: number;
 }
 
 export type JobProcessor = (job: JobRecord) => Promise<JobOutcome>;
@@ -90,7 +92,7 @@ export class JobQueue {
         this.store.failJob(job.id, result.error ?? "failed");
         console.log(`[queue] Job ${job.id} failed (not retryable): ${result.error}`);
       } else {
-        this.handleJobFailure(this.store.getJob(job.id) ?? job, result.error ?? "unknown_error");
+        this.handleJobFailure(this.store.getJob(job.id) ?? job, result.error ?? "unknown_error", result.retryDelayMs);
       }
     } catch (error) {
       this.handleJobFailure(job, error instanceof Error ? error.message : String(error));
@@ -101,10 +103,10 @@ export class JobQueue {
     }
   }
 
-  private handleJobFailure(job: JobRecord, errorMsg: string): void {
+  private handleJobFailure(job: JobRecord, errorMsg: string, minDelayMs = 0): void {
     if (job.attempts < job.maxAttempts) {
-      // Exponential backoff: 1s, 2s, 4s...
-      const delay = Math.min(1000 * Math.pow(2, job.attempts - 1), 30_000);
+      // Exponential backoff: 1s, 2s, 4s... (or longer when the outcome asks for it)
+      const delay = Math.max(minDelayMs, Math.min(1000 * Math.pow(2, job.attempts - 1), 30_000));
       console.log(`[queue] Job ${job.id} failed (attempt ${job.attempts}/${job.maxAttempts}), retrying in ${delay}ms`);
       this.pendingRetries++;
       setTimeout(() => {

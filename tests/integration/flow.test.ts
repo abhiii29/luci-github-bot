@@ -64,8 +64,14 @@ vi.mock("../../src/llm.js", async (orig) => ({
   generatePlanText: vi.fn(async () => llm.plan()),
 }));
 vi.mock("../../src/repo-context.js", () => ({
-  buildRepoContext: vi.fn(async () => ({ promptSection: "--- FILE: src/thing.ts ---\nexport const thing = 1;\n", fileCount: 1 })),
+  buildRepoContext: vi.fn(async () => repoCtx),
 }));
+const repoCtx = {
+  promptSection: "--- FILE: src/thing.ts ---\nexport const thing = 1;\n",
+  fileCount: 1,
+  truncatedPaths: [] as string[],
+  fullContents: { "src/thing.ts": "export const thing = 1;\n" } as Record<string, string>,
+};
 const repoConfig: { config: Record<string, unknown>; warnings: string[] } = { config: {}, warnings: [] };
 vi.mock("../../src/repo-config.js", () => ({ loadRepoConfig: vi.fn(async () => repoConfig) }));
 
@@ -224,6 +230,8 @@ beforeEach(async () => {
     files: [{ path: "src/thing.ts", operation: "update", content: "export const thing = 2;\n" }],
   });
   repoConfig.config = {};
+  repoCtx.truncatedPaths = [];
+  repoCtx.fullContents = { "src/thing.ts": "export const thing = 1;\n" };
   gh.comments.clear();
   gh.labels.clear();
   fs.rmSync(cfg.planDataDir, { recursive: true, force: true });
@@ -257,7 +265,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await queue.stop(1_000);
+  await queue.stop(100);
   (await import("../../src/dispatch.js")).resetDispatch();
   vi.restoreAllMocks();
 });
@@ -376,6 +384,52 @@ describe("model outcomes", () => {
     await settle(8_000);
     expect(llm.calls).toBe(2); // maxAttempts = 2
     expect(jobs(22)[0].status).toBe("failed");
+  });
+});
+
+describe("destructive changes and outages", () => {
+  it("never pushes a whole-file rewrite of a file the model only saw truncated (PR #5)", async () => {
+    const original = Array.from({ length: 200 }, (_, i) => `export const l${i} = ${i};`).join("\n");
+    repoCtx.fullContents = { "src/thing.ts": original };
+    repoCtx.truncatedPaths = ["src/thing.ts"];
+    llm.solution = () => ({
+      success: true,
+      branchName: "bot/version",
+      commitMessage: "Add version",
+      files: [{ path: "src/thing.ts", operation: "update", content: original.split("\n").slice(0, 40).join("\n") }],
+    });
+    await assign(60);
+    await settle(8_000);
+    expect(runs).toHaveLength(0);
+    expect(allComments(60)).toContain("unsafe_change");
+    expect(llm.calls).toBe(2); // retried once: the model may get it right with a patch
+  });
+
+  it("applies a patch to a truncated file and pushes the whole file", async () => {
+    const original = Array.from({ length: 200 }, (_, i) => `export const l${i} = ${i};`).join("\n") + "\n";
+    repoCtx.fullContents = { "src/thing.ts": original };
+    repoCtx.truncatedPaths = ["src/thing.ts"];
+    llm.solution = () => ({
+      success: true,
+      branchName: "bot/version",
+      commitMessage: "Add version",
+      files: [{ path: "src/thing.ts", operation: "patch", content: "<<<<<<< SEARCH\nexport const l0 = 0;\n=======\nexport const l0 = 0;\nexport const version = 1;\n>>>>>>> REPLACE" }],
+    });
+    await assign(61);
+    await settle();
+    expect(runs).toHaveLength(1);
+    expect(jobs(61)[0].status).toBe("succeeded");
+  });
+
+  it("a model outage is reported as such and retried later, not after 1 s", async () => {
+    llm.solution = () => {
+      throw Object.assign(new Error("502 litellm.BadGatewayError: The model backend is unavailable"), { status: 502 });
+    };
+    await assign(62);
+    for (let i = 0; i < 100 && !allComments(62).includes("model_unavailable"); i++) await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 1_500));
+    expect(allComments(62)).toContain("model_unavailable");
+    expect(llm.calls).toBe(1); // still waiting for the delayed retry
   });
 });
 

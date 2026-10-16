@@ -5,8 +5,10 @@ import {
   generatePlanText,
   isLocalModelTrigger,
   extractLocalPrompt,
+  fetchFileContent,
   type CodeGenerationResult,
 } from "./llm.js";
+import { guardChanges } from "./change-guard.js";
 import { DockerWorker, type WorkerProgress } from "./docker-worker.js";
 import { getConfig } from "./config.js";
 import { metrics } from "./metrics.js";
@@ -126,6 +128,19 @@ export function formatPlanComment(state: PlanState): string {
   return redact(lines.join("\n"));
 }
 
+// ── Model outages ────────────────────────────────────────────────────────
+
+/** Wait before retrying when the model endpoint is down (a 1 s retry just fails again). */
+export const MODEL_RETRY_DELAY_MS = 3 * 60_000;
+
+export function isModelUnavailable(err: unknown): boolean {
+  const e = err as { status?: number; code?: string; name?: string; message?: string };
+  if (typeof e?.status === "number" && (e.status === 429 || e.status >= 500)) return true;
+  if (e?.code && /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR/.test(e.code)) return true;
+  if (e?.name === "AbortError" || e?.name === "APIConnectionError" || e?.name === "APIConnectionTimeoutError") return true;
+  return /\b(502|503|504|429)\b|unavailable|bad gateway|timed? ?out|ECONNREFUSED|fetch failed|Ollama 5\d\d/i.test(e?.message ?? "");
+}
+
 // ── retryQueuedIssue ────────────────────────────────────────────────────
 
 /** Prepare an issue for a retry (`needs-retry` label): clear the trigger label, show it as queued. */
@@ -226,6 +241,7 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
       ? `\n\nIMPLEMENT THE APPROVED PLAN. Only these files may change: ${opts.approvedPlanFiles.join(", ")}`
       : "";
     let solution: CodeGenerationResult;
+    try {
     if (useLocal) {
       solution = await generateSolutionWithDecomposition(
         event.issue.title,
@@ -241,6 +257,20 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
         (body || "(no description)") + hintText + scopeNote,
         repoContext.promptSection
       );
+    }
+    } catch (err) {
+      const msg = redact(err instanceof Error ? err.message : String(err));
+      if (isModelUnavailable(err)) {
+        metrics.recordLlmGeneration(false, useLocal);
+        const out = await fail(
+          "model_unavailable",
+          `The ${useLocal ? "local" : "remote"} model is not reachable right now. The bot will retry in a few minutes.`,
+          true,
+          msg
+        );
+        return { ...out, retryDelayMs: MODEL_RETRY_DELAY_MS };
+      }
+      throw err;
     }
     metrics.recordLlmGeneration(solution.success, useLocal);
 
@@ -258,8 +288,25 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
       return await fail("llm_generation", "The model's answer could not be used. It will be retried automatically.", true, solution.error);
     }
 
+    // ── Resolve patches; refuse rewrites that would silently destroy code ──
+    const guarded = await guardChanges(solution.files, {
+      known: repoContext.fullContents,
+      truncatedPaths: repoContext.truncatedPaths,
+      issueText: `${event.issue.title}\n${body}`,
+      fetchCurrent: (p) => fetchFileContent(githubToken, repoFullName, p),
+    });
+    if (!guarded.ok) {
+      return await fail(
+        "unsafe_change",
+        `The generated change was rejected before anything was pushed: ${truncate(guarded.reason, 400)}`,
+        true,
+        guarded.reason
+      );
+    }
+    solution = { ...solution, files: guarded.files };
+
     // ── Validate content and scope before anything leaves the bot ──
-    const content = validateSolutionContent(solution.files, undefined, {
+    const content = validateSolutionContent(solution.files, repoContext.fullContents, {
       warnSecrets: true,
       issueKeywords: `${event.issue.title}\n${body}`,
     });
