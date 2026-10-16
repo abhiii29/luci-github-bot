@@ -28,6 +28,9 @@ const configSchema = z.object({
   containerCpus: z.coerce.number().optional(),
   containerPidsLimit: z.coerce.number().optional(),
   apiToken: z.string().optional(),
+  // Override for GitHub Enterprise / integration tests (worker container only)
+  gitBaseUrl: z.string().optional(),
+  githubApiUrl: z.string().optional(),
   webhookBodyLimit: z.coerce.number().default(1_048_576), // 1 MB
   rateLimitWindowMs: z.coerce.number().default(60_000), // 60s
   rateLimitMaxRequests: z.coerce.number().default(100),
@@ -111,6 +114,8 @@ export function getConfig(): Config {
     containerCpus: env.CONTAINER_CPUS,
     containerPidsLimit: env.CONTAINER_PIDS_LIMIT,
     apiToken: env.API_TOKEN || undefined,
+    gitBaseUrl: env.GIT_BASE_URL || undefined,
+    githubApiUrl: env.GITHUB_API_URL || undefined,
     webhookBodyLimit: env.WEBHOOK_BODY_LIMIT ?? "1048576",
     rateLimitWindowMs: env.RATE_LIMIT_WINDOW_MS ?? "60000",
     rateLimitMaxRequests: env.RATE_LIMIT_MAX_REQUESTS ?? "100",

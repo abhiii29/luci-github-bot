@@ -1,12 +1,14 @@
 import { execFile } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GitHubIssueEvent } from "./webhook.js";
 import { getConfig } from "./config.js";
 import { CodeGenerationResult } from "./llm.js";
 import { ResourceMonitor, ResourceStats } from "./resource-monitor.js";
-import { validateSolution } from "./solution-validator.js";
+import { redact } from "./redact.js";
+import { validateSolution, type ValidateSolutionOptions } from "./solution-validator.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -25,12 +27,39 @@ export type WorkerProgress = {
   message: string;
 };
 
+export interface WorkerRunOptions {
+  /** Base branch for the PR (default: the repo's default branch, detected in the container). */
+  baseBranch?: string;
+  /** Push the branch but do not open a PR. */
+  noPr?: boolean;
+  /** Extra validator options (denied paths, file limits, ...). */
+  validation?: ValidateSolutionOptions;
+}
+
+export type WorkerStatus = "pr_created" | "pr_exists" | "branch_pushed" | "no_changes" | "error";
+
 export interface WorkerResult {
   success: boolean;
   branchName: string;
   prUrl?: string;
   issueNumber: number;
   error?: string;
+  /** Machine-readable outcome reported by the worker script (`RESULT:` line). */
+  status?: WorkerStatus;
+}
+
+/** Extract the last `RESULT: {...}` line the worker script printed. */
+export function parseWorkerResult(logs: string): { status: WorkerStatus; url?: string; branch?: string; error?: string } | null {
+  const lines = logs.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("RESULT:"));
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(lines[i].slice("RESULT:".length).trim());
+      if (parsed && typeof parsed.status === "string") return parsed;
+    } catch {
+      // keep looking
+    }
+  }
+  return null;
 }
 
 /** Whether all worker slots are currently occupied */
@@ -93,13 +122,35 @@ interface ContainerRuntime {
   name: string;
   build(image: string, dockerfile: string, context: string): Promise<void>;
   pull(image: string): Promise<void>;
-  create(image: string, env: string[], containerName: string): Promise<{ id: string }>;
+  create(image: string, spec: ContainerSpec, containerName: string): Promise<{ id: string }>;
   start(containerId: string): Promise<void>;
   logs(containerId: string): Promise<string>;
   inspect(containerId: string): Promise<{ Running: boolean; ExitCode: number }>;
   kill(containerId: string): Promise<void>;
   rm(containerId: string): Promise<void>;
   ps(): Promise<Array<{ Id: string; Name: string; Status: string }>>;
+}
+
+/** What to create a worker container with. Secrets never appear on the host command line. */
+export interface ContainerSpec {
+  /** Plain environment variables (passed as `-e KEY=value`). */
+  env: Record<string, string>;
+  /** Secret environment variables: passed as `-e KEY` with the value in the child's env, not argv. */
+  secretEnv: Record<string, string>;
+  /** Extra `create` flags (resource limits, mounts, tmpfs, security options). */
+  args: string[];
+}
+
+function buildCreateArgs(image: string, spec: ContainerSpec, containerName: string): string[] {
+  return [
+    "create",
+    "--name",
+    containerName,
+    ...Object.entries(spec.env).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+    ...Object.keys(spec.secretEnv).flatMap((k) => ["-e", k]),
+    ...spec.args,
+    image,
+  ];
 }
 
 class PodmanRuntime implements ContainerRuntime {
@@ -124,13 +175,13 @@ class PodmanRuntime implements ContainerRuntime {
     });
   }
 
-  private async runWithOutput(args: string[], opts?: { timeout?: number }): Promise<string> {
+  private async runWithOutput(args: string[], opts?: { timeout?: number; env?: Record<string, string> }): Promise<string> {
     return new Promise((resolve, reject) => {
       const timeout = opts?.timeout ?? 300_000;
       execFile(
         "podman",
         args,
-        { timeout, maxBuffer: 10 * 1024 * 1024 },
+        { timeout, maxBuffer: 10 * 1024 * 1024, env: opts?.env ? { ...process.env, ...opts.env } : process.env },
         (err, stdout) => {
           if (err) reject(err);
           else resolve(stdout.toString());
@@ -147,15 +198,10 @@ class PodmanRuntime implements ContainerRuntime {
     await this.run(["pull", image], { silent: true });
   }
 
-  async create(image: string, env: string[], containerName: string): Promise<{ id: string }> {
-    const envArgs = env.flatMap((e) => ["-e", e]);
-    const result = await this.runWithOutput([
-      "create",
-      "--name",
-      containerName,
-      ...envArgs,
-      image,
-    ]);
+  async create(image: string, spec: ContainerSpec, containerName: string): Promise<{ id: string }> {
+    const result = await this.runWithOutput(buildCreateArgs(image, spec, containerName), {
+      env: spec.secretEnv,
+    });
     const id = result.trim().split("\n")[0].trim();
     return { id };
   }
@@ -238,9 +284,9 @@ class DockerRuntime implements ContainerRuntime {
     });
   }
 
-  private async runWithOutput(args: string[], opts?: { timeout?: number }): Promise<string> {
+  private async runWithOutput(args: string[], opts?: { timeout?: number; env?: Record<string, string> }): Promise<string> {
     return new Promise((resolve, reject) => {
-      execFile("docker", args, { timeout: opts?.timeout ?? 300_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+      execFile("docker", args, { timeout: opts?.timeout ?? 300_000, maxBuffer: 10 * 1024 * 1024, env: opts?.env ? { ...process.env, ...opts.env } : process.env }, (err, stdout) => {
         if (err) reject(err);
         else resolve(stdout.toString());
       });
@@ -255,15 +301,10 @@ class DockerRuntime implements ContainerRuntime {
     await this.run(["pull", image], { silent: true });
   }
 
-  async create(image: string, env: string[], containerName: string): Promise<{ id: string }> {
-    const envArgs = env.flatMap((e) => ["-e", e]);
-    const result = await this.runWithOutput([
-      "create",
-      "--name",
-      containerName,
-      ...envArgs,
-      image,
-    ]);
+  async create(image: string, spec: ContainerSpec, containerName: string): Promise<{ id: string }> {
+    const result = await this.runWithOutput(buildCreateArgs(image, spec, containerName), {
+      env: spec.secretEnv,
+    });
     const id = result.trim().split("\n")[0].trim();
     return { id };
   }
@@ -394,19 +435,7 @@ export class DockerWorker {
       );
     }
 
-    try {
-      await execFile(
-        this.runtime.name,
-        ["image", "inspect", this.imageTag],
-        { timeout: 5_000, maxBuffer: 1024 }
-      );
-      this.imageBuilt = true;
-      console.log(`[worker] ${this.runtime.name} image already exists`);
-      return;
-    } catch {
-      // Build it
-    }
-
+    // Always (re)build: layers are cached, and this guarantees the image matches images/worker.sh.
     console.log(`[worker] Building ${this.runtime.name} image...`);
     try {
       await this.runtime.build(this.imageTag, this.dockerfilePath, this.contextDir);
@@ -433,7 +462,8 @@ export class DockerWorker {
   async processIssue(
     event: GitHubIssueEvent,
     solution: CodeGenerationResult,
-    onProgress?: (progress: WorkerProgress) => void
+    onProgress?: (progress: WorkerProgress) => void,
+    opts: WorkerRunOptions = {}
   ): Promise<WorkerResult> {
     const config = getConfig();
     const repoFullName = event.repository.full_name;
@@ -445,6 +475,7 @@ export class DockerWorker {
       branchName,
       solution.commitMessage,
       solution.files,
+      opts.validation
     );
     if (!validation.valid) {
       const reason = validation.errors.map(e => e.reason).join("; ");
@@ -465,7 +496,9 @@ export class DockerWorker {
     // Acquire semaphore slot
     await this.semaphore.acquire();
     let containerId: string | null = null;
-    const solutionPath = "/tmp/.luci-solution.json";
+    // Unique per container so concurrent workers never overwrite each other's solution
+    const solutionPath = path.join(os.tmpdir(), `luci-solution-${containerName}.json`);
+    const solutionTarget = "/tmp/.luci-solution.json";
 
     try {
       onProgress?.({
@@ -478,69 +511,90 @@ export class DockerWorker {
         await this.ensureImage();
       }
 
-      // Pull image (best effort)
-      onProgress?.({ stage: "pulling", message: "Pulling image..." });
-      try {
-        await this.runtime.pull(this.imageTag);
-      } catch {
-        // Image already local or build is in progress
-      }
+      const env: Record<string, string> = {
+        REPO_FULL_NAME: repoFullName,
+        ISSUE_NUMBER: String(issueNumber),
+        BRANCH_NAME: branchName,
+        COMMIT_MESSAGE: solution.commitMessage,
+        GIT_AUTHOR_NAME: config.gitAuthorName,
+        GIT_AUTHOR_EMAIL: config.gitAuthorEmail,
+        SOLUTION_FILE: solutionTarget,
+      };
+      if (opts.baseBranch) env.BASE_BRANCH = opts.baseBranch;
+      if (opts.noPr) env.NO_PR = "1";
+      if (config.gitBaseUrl) env.GIT_BASE_URL = config.gitBaseUrl;
+      if (config.githubApiUrl) env.API_BASE_URL = config.githubApiUrl;
 
-      const env = [
-        `GITHUB_TOKEN=${config.githubToken}`,
-        `REPO_FULL_NAME=${repoFullName}`,
-        `ISSUE_NUMBER=${issueNumber}`,
-        `BRANCH_NAME=${branchName}`,
-        `COMMIT_MESSAGE=${solution.commitMessage}`,
-        `GIT_AUTHOR_NAME=${config.gitAuthorName}`,
-        `GIT_AUTHOR_EMAIL=${config.gitAuthorEmail}`,
-        `SOLUTION_FILE=${solutionPath}`,
-        `WORKER_TIMEOUT_MS=${config.workerTimeoutMs}`,
-      ];
+      const args: string[] = [];
+      if (config.containerMemory) args.push("--memory", config.containerMemory);
+      if (config.containerCpus) args.push("--cpus", String(config.containerCpus));
+      if (config.containerPidsLimit) args.push("--pids-limit", String(config.containerPidsLimit));
+      args.push("--cap-drop=ALL");
+      args.push("--security-opt", "no-new-privileges");
+      args.push("--read-only");
+      // The image runs as the unprivileged `node` user (uid 1000); give it writable scratch space.
+      // podman chowns tmpfs to the container user with `U`; docker takes uid/gid mount options.
+      const owner = this.runtime.name === "podman" ? "U" : "uid=1000,gid=1000";
+      args.push("--tmpfs", `/tmp:rw,noexec,nosuid,size=64m,${owner}`);
+      args.push("--tmpfs", `/home/node:rw,noexec,nosuid,size=16m,${owner}`);
+      args.push("--tmpfs", `/workspace:rw,noexec,nosuid,size=512m,${owner}`);
 
-      const containerArgs: string[] = [];
-      if (config.containerMemory) containerArgs.push("--memory", config.containerMemory);
-      if (config.containerCpus) containerArgs.push("--cpus", String(config.containerCpus));
-      if (config.containerPidsLimit) containerArgs.push("--pids-limit", String(config.containerPidsLimit));
-      containerArgs.push("--cap-drop=ALL");
-      containerArgs.push("--security-opt", "no-new-privileges");
-      containerArgs.push("--read-only");
-      containerArgs.push("--tmpfs", "/tmp:rw,noexec,nosuid,size=64m");
-      containerArgs.push("--tmpfs", "/home:rw,noexec,nosuid,size=16m");
+      fs.writeFileSync(
+        solutionPath,
+        JSON.stringify({
+          branchName: solution.branchName,
+          commitMessage: solution.commitMessage,
+          files: solution.files,
+        }),
+        { mode: 0o644 }
+      );
+      args.push("--mount", `type=bind,source=${solutionPath},target=${solutionTarget},ro`);
 
-      const solutionJson = JSON.stringify({
-        branchName: solution.branchName,
-        commitMessage: solution.commitMessage,
-        files: solution.files,
-      });
-      fs.writeFileSync(solutionPath, solutionJson);
-      containerArgs.push("--mount", `type=bind,source=${solutionPath},target=${solutionPath},ro`);
-
-      // Create container
+      // Create container (the token travels via the child's environment, not argv)
       onProgress?.({ stage: "running", message: "Creating container..." });
-      const envArgs = env.flatMap((e) => ["-e", e]);
       const { id } = await this.runtime.create(
         this.imageTag,
-        [...envArgs, ...containerArgs],
+        { env, secretEnv: { GITHUB_TOKEN: config.githubToken }, args },
         containerName
       );
       containerId = id;
 
       onProgress?.({
         stage: "cloning",
-        message: "Container started, cloning repo and coding...",
+        message: "Container started, cloning repo and applying changes...",
       });
 
       // Start container (this blocks until completion or timeout)
       await this.runtime.start(id);
 
-      // Check result
       const state = await this.runtime.inspect(id);
+      if (state.Running) {
+        await this.runtime.kill(id).catch(() => {});
+        throw new Error(`Worker timed out after ${Math.round(config.workerTimeoutMs / 1000)}s`);
+      }
 
-      if (state.ExitCode !== 0) {
-        const logs = await this.runtime.logs(id);
-        const errorLog = logs.slice(-2000);
-        throw new Error(`Worker exited with code ${state.ExitCode}: ${errorLog}`);
+      const logs = await this.runtime.logs(id);
+      const result = parseWorkerResult(logs);
+
+      if (state.ExitCode !== 0 || result?.status === "error") {
+        const detail = result?.error ?? logs.slice(-2000);
+        throw new Error(`Worker exited with code ${state.ExitCode}: ${redact(detail)}`);
+      }
+      if (!result) {
+        throw new Error("Worker finished without reporting a result");
+      }
+
+      const effectiveBranch = result.branch || branchName;
+
+      if (result.status === "no_changes") {
+        onProgress?.({ stage: "complete", message: `Worker made no changes for #${issueNumber}` });
+        return {
+          success: false,
+          status: "no_changes",
+          branchName: effectiveBranch,
+          issueNumber,
+          error: "The generated solution did not change any file",
+        };
       }
 
       onProgress?.({
@@ -550,11 +604,13 @@ export class DockerWorker {
 
       return {
         success: true,
-        branchName,
+        status: result.status,
+        branchName: effectiveBranch,
+        prUrl: result.url,
         issueNumber,
       };
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg = redact(error instanceof Error ? error.message : String(error));
       console.error(`[worker] Failed for #${issueNumber}:`, errorMsg);
 
       onProgress?.({
@@ -566,13 +622,14 @@ export class DockerWorker {
       if (containerId) {
         try {
           const logs = await this.runtime.logs(containerId);
-          console.error(`[worker] Container logs:\n${logs.slice(-3000)}`);
+          console.error(`[worker] Container logs:\n${redact(logs.slice(-3000))}`);
         } catch {}
         await this.runtime.kill(containerId).catch(() => {});
       }
 
       return {
         success: false,
+        status: "error",
         branchName,
         issueNumber,
         error: errorMsg,
