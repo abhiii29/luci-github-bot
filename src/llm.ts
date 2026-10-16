@@ -266,7 +266,8 @@ export async function generateSolution(
       config.adassoModel,
       prompt.system,
       prompt.user + fileContext,
-      14000
+      // Files are returned whole (llm.ts alone is ~10k tokens) and reasoning shares the budget.
+      32000
     );
   } catch (err) {
     // A cut-off answer yields half-written files; never turn it into a PR.
