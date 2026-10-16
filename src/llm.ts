@@ -478,12 +478,17 @@ function resolveConflicts(results: CodeGenerationResult[]): CodeGenerationResult
 // Top-level decomposition pipeline
 // ---------------------------------------------------------------------------
 
+/** A single local Ollama instance is the bottleneck; more parallel requests just queue up there. */
+const LOCAL_SUBTASK_PARALLELISM = 2;
+
 export async function generateSolutionWithDecomposition(
   issueTitle: string,
   issueBody: string,
   repoContext: string,
   existingFiles: string[],
-  githubToken?: string
+  githubToken?: string,
+  /** "owner/repo" — used to fetch current file contents (repoContext is prompt text, not a name). */
+  repoFullName?: string
 ): Promise<CodeGenerationResult> {
   console.log("[llm] Phase 1: Decomposing issue...");
   const decomposition = await decomposeIssue(issueTitle, issueBody, repoContext, existingFiles);
@@ -537,10 +542,10 @@ export async function generateSolutionWithDecomposition(
   }
 
   let fileContents: Record<string, string> = {};
-  if (githubToken) {
+  if (githubToken && repoFullName) {
     const allFiles = new Set(decomposition.subtasks.flatMap((st) => st.files));
     const fetchPromises = Array.from(allFiles).map(async (f) => {
-      const content = await fetchFileContent(githubToken, repoContext, f);
+      const content = await fetchFileContent(githubToken, repoFullName, f);
       if (content) fileContents[f] = content;
     });
     await Promise.all(fetchPromises);
@@ -565,15 +570,35 @@ export async function generateSolutionWithDecomposition(
       break;
     }
 
-    console.log(`[llm] Phase 2: Executing ${ready.length} subtask(s) in parallel...`);
-    const tasks = ready.map((st) => executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, config, 0));
-    const batchResults = await Promise.all(tasks);
-    executed.push(...batchResults);
+    // Subtasks that touch the same file must not run side by side (the later write would drop the
+    // earlier one's changes): defer them to a later round, where they see the updated content.
+    const claimed = new Set<string>();
+    const batch = ready.filter((st) => {
+      if (st.files.some((f) => claimed.has(f))) return false;
+      st.files.forEach((f) => claimed.add(f));
+      return true;
+    });
 
-    for (const st of ready) resolved.add(st.id);
-    const readyIds = new Set(ready.map((st) => st.id));
+    console.log(`[llm] Phase 2: Executing ${batch.length} subtask(s), at most ${LOCAL_SUBTASK_PARALLELISM} at a time...`);
+    for (let i = 0; i < batch.length; i += LOCAL_SUBTASK_PARALLELISM) {
+      const chunk = batch.slice(i, i + LOCAL_SUBTASK_PARALLELISM);
+      const results = await Promise.all(
+        chunk.map((st) => executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, config, 0))
+      );
+      executed.push(...results);
+      // Later subtasks build on what earlier ones wrote
+      for (const r of results) {
+        for (const f of r.files) {
+          if (f.operation === "delete") delete fileContents[f.path];
+          else fileContents[f.path] = f.content;
+        }
+      }
+    }
+
+    for (const st of batch) resolved.add(st.id);
+    const doneIds = new Set(batch.map((st) => st.id));
     for (let i = remaining.length - 1; i >= 0; i--) {
-      if (readyIds.has(remaining[i].id)) remaining.splice(i, 1);
+      if (doneIds.has(remaining[i].id)) remaining.splice(i, 1);
     }
   }
 

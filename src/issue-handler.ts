@@ -221,7 +221,8 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
         extractLocalPrompt(event.issue.title, body || undefined) + hintText + scopeNote,
         repoContext.promptSection,
         [],
-        githubToken
+        githubToken,
+        repoFullName
       );
     } else {
       solution = await generateSolution(
