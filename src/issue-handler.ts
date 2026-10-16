@@ -202,6 +202,19 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
   };
 
   try {
+    // Idempotency: a re-run (restart recovery, duplicate trigger) must not open a second PR.
+    if (!opts.planOnly || opts.approvedPlanFiles) {
+      const existing = await gh.findOpenBotPrForIssue(repoFullName, issueNumber).catch(() => undefined);
+      if (existing) {
+        await setStatusLabel(gh, repoFullName, issueNumber, "bot:awaiting-review");
+        await updateStatusComment(gh, repoFullName, issueNumber, "pr-opened", {
+          prUrl: existing.url,
+          notes: [...notes, `PR #${existing.number} is already open for this issue. Close it, then reply \`/luci retry\` for a new attempt.`],
+        });
+        return { success: true, prUrl: existing.url };
+      }
+    }
+
     const w = getWorker();
     if (w.getCapacity().full) {
       // The worker semaphore waits for a slot; tell the user why it's slow.
