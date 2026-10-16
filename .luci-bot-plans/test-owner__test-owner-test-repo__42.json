@@ -1,0 +1,29 @@
+{
+  "plan": {
+    "branchName": "feat/issue-42",
+    "commitMessage": "Add rate limiting",
+    "files": [
+      {
+        "path": "src/rate-limiter.ts",
+        "operation": "create",
+        "reason": "New rate limiter module"
+      },
+      {
+        "path": "src/webhook.ts",
+        "operation": "update",
+        "reason": "Add rate limiting check"
+      }
+    ],
+    "approach": "Add a sliding window rate limiter to the webhook handler",
+    "risks": [
+      "In-memory state lost on restart"
+    ],
+    "openQuestions": [
+      "Should we support distributed rate limiting?"
+    ],
+    "createdAt": "2026-10-16T00:03:06.404Z"
+  },
+  "status": "expired",
+  "issueBodyHash": "ryz5ov",
+  "expiredAt": "2026-10-16T00:03:06.405Z"
+}

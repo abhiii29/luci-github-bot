@@ -6,6 +6,11 @@ import { parseCommand, type CommandName, type IssueCommentPayload } from "../src
 import { metrics } from "../src/metrics.js";
 import { resolveLabelSwitches } from "../src/label-switches.js";
 
+// The real check hits the GitHub API; default to "is collaborator" unless a test injects its own.
+vi.mock("../src/collaborators.js", () => ({
+  isCollaborator: vi.fn().mockResolvedValue(true),
+}));
+
 // ---------------------------------------------------------------------------
 // parseCommand: basic parsing
 // ---------------------------------------------------------------------------
