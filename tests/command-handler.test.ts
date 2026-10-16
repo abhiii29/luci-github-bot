@@ -40,18 +40,18 @@ describe("buildCommandHooks go", () => {
 
   it("calls createSplitIssues and returns sub-issue message when plan has 2+ parts", async () => {
     const parts = [{ title: "Part 1", scope: "s1", files: ["a.ts"] }, { title: "Part 2", scope: "s2", files: ["b.ts"] }];
-    const planState = { plan: { parts, files: [] }, status: "pending" } as any;
+    const planState = { plan: { parts, files: [] }, status: "pending", issueBodyHash: "abc123" } as any;
     vi.mocked(getPlanState).mockReturnValue(planState);
     vi.mocked(planKeyFor).mockReturnValue("key");
     vi.mocked(getConfig).mockReturnValue({ githubToken: "tok", botUsername: "bot" } as any);
-    vi.mocked(GitHubClient).mockImplementation(() => ({}) as any);
+    vi.mocked(GitHubClient).mockImplementation(function () { return {}; } as any);
     vi.mocked(createSplitIssues).mockResolvedValue([101, 102]);
 
     const hooks = buildCommandHooks(mockEvent);
     const result = await hooks.go("user");
 
     expect(createSplitIssues).toHaveBeenCalled();
-    expect(approvePlan).not.toHaveBeenCalled();
+    expect(approvePlan).toHaveBeenCalledWith("key", "user");
     expect(result).toContain("split into 2 sub-issues: #101, #102");
     expect(result).toContain("Part 1 (#101) has been assigned and starts now.");
   });

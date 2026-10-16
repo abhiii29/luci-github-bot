@@ -57,13 +57,14 @@ export function buildCommandHooks(e: GitHubCommentEvent): CommandHooks {
       if ((state.issueBodyHash ?? state.plan.issueBodyHash) !== hashIssueBody(e.issue.body ?? "")) {
         return `@${u} the issue changed after the plan was written. Reply \`/luci plan\` to re-plan.`;
       }
+      approvePlan(planKeyFor(repo, n), u);
+      // Approve first so a repeated /luci go is rejected instead of creating a second set of sub-issues.
       if (state.plan.parts && state.plan.parts.length >= 2) {
         const config = getConfig();
-        const gh = new GitHubClient(config.githubToken);
+        const gh = new GitHubClient({ token: config.githubToken, retries: 2 });
         const numbers = await createSplitIssues(gh, repo, { number: n, title: e.issue.title }, state.plan.parts, config.botUsername ?? "");
         return `@${u} split into ${numbers.length} sub-issues: ${numbers.map((x) => "#" + x).join(", ")}. Part 1 (#${numbers[0]}) has been assigned and starts now.`;
       }
-      approvePlan(planKeyFor(repo, n), u);
       const files = state.plan.files.map((f) => f.path);
       return enqueueWith(e, u, (o) => {
         o.planOnly = true;
