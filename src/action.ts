@@ -7,6 +7,8 @@ import { JsonQueueStore } from "./store.js";
 import type { JobQueue } from "./queue.js";
 import { logger } from "./logger.js";
 import { redact, addSecret } from "./redact.js";
+import { GitHubClient } from "./github.js";
+import { loadIssueState, saveIssueState } from "./issue-state.js";
 
 /**
  * GitHub Action entrypoint: handle the single `issues` / `issue_comment` event that triggered this
@@ -14,8 +16,8 @@ import { redact, addSecret } from "./redact.js";
  * server; only the transport differs (no HTTP server, no ngrok, no signature check — GitHub itself
  * delivered the event).
  *
- * State (queue + plans) lives in LUCI_STATE_DIR, which the workflow restores and saves with
- * actions/cache per issue so `/luci plan` → `/luci go` and `/luci status` work across runs.
+ * State (queue + plans) lives in LUCI_STATE_DIR and is carried between runs in a hidden comment on
+ * the issue (see issue-state.ts), so `/luci plan` → `/luci go` and `/luci status` work across runs.
  */
 
 /** Defaults that only make sense inside Actions; explicit env always wins. */
@@ -64,6 +66,14 @@ async function main(): Promise<void> {
 
   const stateDir = process.env.LUCI_STATE_DIR!;
   fs.mkdirSync(stateDir, { recursive: true });
+  const payload = JSON.parse(fs.readFileSync(eventPath, "utf-8")) as { issue?: { number?: number } };
+  const issueNumber = payload.issue?.number;
+  const repo = process.env.GITHUB_REPOSITORY ?? "";
+  const gh = new GitHubClient({ token: config.githubToken, retries: 2 });
+  if (issueNumber) {
+    const restored = await loadIssueState(gh, repo, issueNumber, config.botUsername ?? "", stateDir);
+    if (restored) logger.info(`[action] Restored ${restored} state file(s) for #${issueNumber}`);
+  }
   const store = new JsonQueueStore(path.join(stateDir, "queue.json"));
   const abandoned = store.abandonOpenJobs();
   if (abandoned.length > 0) logger.info(`[action] Marked ${abandoned.length} job(s) from a cancelled run as interrupted`);
@@ -74,13 +84,17 @@ async function main(): Promise<void> {
   await queue.start();
 
   try {
-    const payload = JSON.parse(fs.readFileSync(eventPath, "utf-8")) as unknown;
     const routed = await runEvent(eventName, payload, queue);
     if (routed.code >= 400) throw new Error(`event rejected: ${JSON.stringify(routed.body)}`);
   } finally {
     await queue.stop(1_000);
     await worker.stop();
     store.save();
+    if (issueNumber) {
+      await saveIssueState(gh, repo, issueNumber, config.botUsername ?? "", stateDir).catch((err) =>
+        logger.warn(`[action] Could not save issue state: ${redact(err instanceof Error ? err.message : String(err))}`)
+      );
+    }
   }
 
   // The issue already shows the failure; a red run makes it visible in the Actions tab too

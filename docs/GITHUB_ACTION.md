@@ -28,8 +28,10 @@ Assign an issue to the bot user, as before.
 
 ## Differences from the server
 
-- **State** (job history, plans) is kept per issue in the Actions cache, so `/luci plan` → `/luci go`
-  and `/luci status` work across runs. Cache entries unused for 7 days are evicted; so do plans.
+- **State** (job history, plans) is kept per issue in one hidden comment written by the bot
+  (`<!-- luci-bot:state … -->`), so `/luci plan` → `/luci go` and `/luci status` work across runs.
+  Don't edit or delete it. (The Actions cache can't be used: `issues`/`issue_comment` runs get
+  read-only cache access.)
 - **One run per issue at a time** (`concurrency` group). Events arriving meanwhile wait; GitHub keeps
   only the newest waiting run per issue.
 - **Cancelling a running job**: cancel the workflow run in the Actions tab. `/luci cancel` still drops

@@ -34,10 +34,9 @@ on:
       adesso-api-key:
         required: true
 
-# actions: write is for the per-issue state cache; the bot itself uses bot-token
+# The bot itself uses bot-token
 permissions:
   contents: read
-  actions: write
 
 jobs:
   run:
@@ -63,14 +62,6 @@ jobs:
         working-directory: bot
         run: npm ci && npm run build
 
-      # Queue + plan state per issue, so `/luci plan` → `/luci go` and `/luci status` work across runs
-      - name: Restore issue state
-        uses: actions/cache/restore@v4
-        with:
-          path: bot/.luci-state
-          key: luci-state-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: luci-state-${{ github.repository_id }}-${{ github.event.issue.number }}-
-
       - name: Run bot
         working-directory: bot
         run: node dist/action.js
@@ -81,11 +72,6 @@ jobs:
           ADASSO_BASE_URL: ${{ inputs.adesso-base-url }}
           ADASSO_MODEL: ${{ inputs.adesso-model }}
           DRY_RUN: ${{ inputs.dry-run && '1' || '' }}
+          # Per-issue state is carried in a hidden comment on the issue (issue-state.ts)
           LUCI_STATE_DIR: .luci-state
 
-      - name: Save issue state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: bot/.luci-state
-          key: luci-state-${{ github.repository_id }}-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -226,6 +226,24 @@ export class GitHubClient {
     return data.find((c) => c.body.includes(BOT_COMMENT_MARKER));
   }
 
+  /** First comment containing `marker`, optionally only one written by `author`. */
+  async findCommentWithMarker(
+    repo: string,
+    issueNumber: number,
+    marker: string,
+    author?: string
+  ): Promise<{ id: number; body: string } | undefined> {
+    const res = await this.fetchWithRetry(
+      `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
+      { headers: this.headers() }
+    );
+    if (!res.ok) return undefined;
+    const data = (await res.json()) as Array<{ id: number; body: string; user?: { login?: string } }>;
+    return data.find(
+      (c) => c.body.includes(marker) && (!author || c.user?.login?.toLowerCase() === author.toLowerCase())
+    );
+  }
+
   /** An open PR the bot already made for this issue (its body says "Closes #N"), if any. */
   async findOpenBotPrForIssue(repo: string, issueNumber: number): Promise<{ url: string; number: number } | undefined> {
     const res = await this.fetchWithRetry(
