@@ -118,8 +118,8 @@ export async function handleIssueComment(e: GitHubCommentEvent): Promise<void> {
   const config = getConfig();
   const [owner, repo] = e.repository.full_name.split("/");
   const author = e.comment.user;
-  const isBot =
-    author.type === "Bot" || (!!config.botUsername && author.login.toLowerCase() === config.botUsername.toLowerCase());
+  // Only GitHub App/bot accounts are skipped here; the webhook already drops the bot's own replies by content.
+  const isBot = author.type === "Bot";
 
   const res = await handleCommentCommand(
     {

@@ -184,7 +184,13 @@ function send(event: string, payload: unknown, deliveryId = `d-${++delivery}`) {
 const assign = (n: number, extra: Record<string, unknown> = {}, deliveryId?: string) =>
   send("issues", { action: "assigned", issue: issue(n, extra), assignee: { login: BOT }, repository, sender: { login: "maintainer" } }, deliveryId);
 const comment = (n: number, body: string, user = "maintainer", issueExtra: Record<string, unknown> = {}) =>
-  send("issue_comment", { action: "created", issue: issue(n, issueExtra), comment: { id: 1, body, user: { login: user, type: "User" } }, repository, sender: { login: user } });
+  send("issue_comment", {
+    action: "created",
+    issue: issue(n, issueExtra),
+    comment: { id: 1, body, user: { login: user, type: user.endsWith("[bot]") ? "Bot" : "User" } },
+    repository,
+    sender: { login: user },
+  });
 
 async function settle(ms = 3_000) {
   const end = Date.now() + ms;
@@ -384,11 +390,21 @@ describe("/luci commands", () => {
     expect(runs).toHaveLength(0);
   });
 
-  it("the bot's own comments never trigger commands", async () => {
-    await comment(33, "/luci retry", BOT);
+  it("the bot's own status/reply comments never trigger commands", async () => {
+    await comment(33, "<!-- luci-bot:status -->\n/luci retry", BOT);
+    await comment(33, "/luci retry", "some-app[bot]");
     await settle();
     expect(runs).toHaveLength(0);
     expect(gh.comments.get(33) ?? []).toHaveLength(0);
+  });
+
+  it("works when the bot runs as the maintainer's own account", async () => {
+    gh.collaborators.add(BOT);
+    expect((await send("issues", { action: "assigned", issue: issue(35), assignee: { login: BOT }, repository, sender: { login: BOT } })).body.status).toBe("queued");
+    await settle();
+    await comment(36, "/luci retry", BOT);
+    await settle();
+    expect(runs.map((r) => r.issue)).toEqual([35, 36]);
   });
 
   it("/luci explain answers without calling the model", async () => {

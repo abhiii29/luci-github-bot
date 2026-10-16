@@ -50,8 +50,9 @@ issue assigned to bot ──► webhook (HMAC, dedupe) ──► durable job que
 | Add the `needs-retry` label | Queue a new attempt |
 | Comment `/luci <command>` | See [Commands](#commands) |
 
-The bot ignores closed issues, pull requests, issues labelled `bot:no-run`, events sent by the bot
-itself, and assignments of other users. The bot user is `GITHUB_BOT_USERNAME`, or the owner of the
+The bot ignores closed issues, pull requests, issues labelled `bot:no-run`, its own comments, and
+assignments of other users. It can run as your own GitHub account: assigning an issue to yourself
+then triggers it. The bot user is `GITHUB_BOT_USERNAME`, or the owner of the
 first monitored repo if that is unset. Logins are matched case-insensitively.
 
 ### Commands

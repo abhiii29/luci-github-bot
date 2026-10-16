@@ -151,11 +151,10 @@ describe("Trigger rules", () => {
     expect(handlerCalled).toBe(true);
   });
 
-  it("ignores self-assignment (sender is the bot)", async () => {
+  it("accepts self-assignment (the bot may run as the maintainer's own account)", async () => {
     const res = await send(makeIssuePayload({ sender: { login: "luci-github-bot" } }));
     expect(res.status).toBe(200);
-    expect(res.body.status).toBe("ignored");
-    expect(handlerCalled).toBe(false);
+    expect(res.body.status).toBe("accepted");
   });
 
   it("ignores closed issues", async () => {

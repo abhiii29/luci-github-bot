@@ -287,7 +287,10 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
         if (c.action !== "created" || !c.comment || c.issue.pull_request) {
           return res.status(200).json({ status: "ignored" });
         }
-        if (!/^\s*\/luci\b/im.test(c.comment.body ?? "") || isBotLogin(c.comment.user?.login) || c.comment.user?.type === "Bot") {
+        // Loop prevention is content-based: the bot's own comments never start with /luci and carry its
+        // marker. (A login check would break the common setup where the bot runs as your own account.)
+        const text = c.comment.body ?? "";
+        if (!/^\s*\/luci\b/im.test(text) || text.includes("<!-- luci-bot") || c.comment.user?.type === "Bot") {
           return res.status(200).json({ status: "ignored" });
         }
         if (!commentHandler) return res.status(200).json({ status: "ignored", reason: "commands_disabled" });
@@ -306,7 +309,8 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
       // ── Retry: `needs-retry` label added (or present when the issue is edited) ──
       const retryLabelAdded = event.action === "labeled" && event.label?.name === "needs-retry";
       const retryOnEdit = event.action === "edited" && event.issue.labels.some((l) => l.name === "needs-retry");
-      if ((retryLabelAdded || retryOnEdit) && retryHandler && !isBotLogin(event.sender.login)) {
+      // The bot never adds `needs-retry` itself (it only removes it), so no sender check is needed.
+      if ((retryLabelAdded || retryOnEdit) && retryHandler) {
         logger.info(`[webhook] Retry triggered for issue #${event.issue.number} in ${event.repository.full_name}`);
         retryHandler(event).catch((error) => {
           logger.error(
@@ -334,10 +338,7 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
         logger.info(`[webhook] Ignoring assign #${event.issue.number} — assigned to ${assignee}`);
         return res.status(200).json({ status: "ignored", assignee });
       }
-      if (isBotLogin(event.sender.login)) {
-        logger.info(`[webhook] Ignoring self-assignment #${event.issue.number}`);
-        return res.status(200).json({ status: "ignored" });
-      }
+      // Self-assignment is allowed: the bot never assigns issues, and it may run as your own account.
       if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
         logger.info(`[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`);
         return res.status(200).json({ status: "ignored" });
