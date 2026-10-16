@@ -244,6 +244,72 @@ export class GitHubClient {
     );
   }
 
+  async createIssue(repo: string, title: string, body: string): Promise<{ number: number; url: string }> {
+    const res = await this.fetchWithRetry(`https://api.github.com/repos/${repo}/issues`, {
+      method: "POST",
+      headers: this.jsonHeaders(),
+      body: JSON.stringify({ title, body }),
+    });
+    if (!res.ok) {
+      const bodyText = await safeBody(res);
+      throw Object.assign(
+        new Error(`createIssue ${res.status}: ${redactError(bodyText)}`),
+        { status: res.status, retries: 0 } as ClientError
+      );
+    }
+    const data = (await res.json()) as { number: number; html_url: string };
+    return { number: data.number, url: data.html_url };
+  }
+
+  async getIssue(
+    repo: string,
+    issueNumber: number
+  ): Promise<{ number: number; state: string; title: string; body: string; author: string; assignees: string[]; isPullRequest: boolean }> {
+    const res = await this.fetchWithRetry(`https://api.github.com/repos/${repo}/issues/${issueNumber}`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      const bodyText = await safeBody(res);
+      throw Object.assign(
+        new Error(`getIssue ${res.status}: ${redactError(bodyText)}`),
+        { status: res.status, retries: 0 } as ClientError
+      );
+    }
+    const data = (await res.json()) as {
+      number: number;
+      state: string;
+      title: string;
+      body: string | null;
+      user?: { login?: string };
+      assignees?: Array<{ login: string }>;
+      pull_request?: unknown;
+    };
+    return {
+      number: data.number,
+      state: data.state,
+      title: data.title,
+      body: data.body ?? "",
+      author: data.user?.login ?? "",
+      assignees: (data.assignees ?? []).map((a) => a.login),
+      isPullRequest: !!data.pull_request,
+    };
+  }
+
+  async addAssignees(repo: string, issueNumber: number, logins: string[]): Promise<void> {
+    const res = await this.fetchWithRetry(`https://api.github.com/repos/${repo}/issues/${issueNumber}/assignees`, {
+      method: "POST",
+      headers: this.jsonHeaders(),
+      body: JSON.stringify({ assignees: logins }),
+    });
+    if (!res.ok) {
+      const bodyText = await safeBody(res);
+      throw Object.assign(
+        new Error(`addAssignees ${res.status}: ${redactError(bodyText)}`),
+        { status: res.status, retries: 0 } as ClientError
+      );
+    }
+  }
+
   /** An open PR the bot already made for this issue (its body says "Closes #N"), if any. */
   async findOpenBotPrForIssue(repo: string, issueNumber: number): Promise<{ url: string; number: number } | undefined> {
     const res = await this.fetchWithRetry(

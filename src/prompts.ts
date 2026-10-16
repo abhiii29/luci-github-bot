@@ -146,6 +146,10 @@ RULES:
 // Plan prompt builder (plan-only / approval flow): a plan, never code
 // ---------------------------------------------------------------------------
 
+/** A plan touching more files than this should be split into parts. */
+export const MAX_FILES_PER_PART = 6;
+export const MAX_PARTS = 6;
+
 export function buildPlanPrompt(
   issueTitle: string,
   issueBody: string,
@@ -168,11 +172,16 @@ APPROACH: <2-3 sentences>
 FILES: <path>:<create|update|delete>:<one-line reason>
 RISK: <risk>
 QUESTION: <open question for the maintainer>
+PART: <title> :: <what this part delivers, 1-3 sentences> :: <comma-separated paths>
 
 RULES:
 - List every file that must change, and only those.
 - Prefer the smallest change that fulfils the issue.
-- Use paths exactly as they appear in the repository context.`;
+- Use paths exactly as they appear in the repository context.
+- If the work is too big for one reviewable pull request (more than ${MAX_FILES_PER_PART} files, or
+  stages that are better reviewed and merged separately), split it: output 2-${MAX_PARTS} PART lines in
+  the order they must be merged. Each part must work on its own once the earlier parts are merged.
+  Use FILES lines for the first part only. Otherwise output no PART lines.`;
 
   const user = [
     `REPOSITORY CONTEXT (${repoDelimiter}):`,

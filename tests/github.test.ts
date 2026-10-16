@@ -206,4 +206,67 @@ describe("GitHubClient", () => {
     const client = new GitHubClient({ token: "ghp_testtoken12345678901234567890ab" });
     await expect(client.updateComment("owner/repo", 42, "updated")).resolves.toBeUndefined();
   });
+// ── Issues: create / get / assign ──
+
+  function capture(status: number, body: unknown) {
+    const calls: Array<{ url: string; method: string; payload?: unknown }> = [];
+    global.fetch = async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: url.toString(), method: init?.method ?? "GET", payload: init?.body ? JSON.parse(String(init.body)) : undefined });
+      return {
+        ok: status < 400,
+        status,
+        statusText: status < 400 ? "OK" : "Error",
+        headers: new Map(),
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      } as unknown as Response;
+    };
+    return calls;
+  }
+  const token = "ghp_testtoken12345678901234567890ab";
+
+  it("createIssue posts title and body and returns number and url", async () => {
+    const calls = capture(201, { number: 12, html_url: "https://github.com/owner/repo/issues/12" });
+    const r = await new GitHubClient({ token }).createIssue("owner/repo", "Part 1", "Do it");
+    expect(r).toEqual({ number: 12, url: "https://github.com/owner/repo/issues/12" });
+    expect(calls[0]).toEqual({ url: "https://api.github.com/repos/owner/repo/issues", method: "POST", payload: { title: "Part 1", body: "Do it" } });
+  });
+
+  it("createIssue throws on 4xx", async () => {
+    capture(422, { message: "Validation Failed" });
+    await expect(new GitHubClient({ token }).createIssue("owner/repo", "t", "b")).rejects.toThrow("createIssue 422");
+  });
+
+  it("getIssue maps the issue", async () => {
+    const calls = capture(200, {
+      number: 5, state: "open", title: "T", body: null,
+      user: { login: "luci" }, assignees: [{ login: "a" }, { login: "b" }],
+    });
+    const r = await new GitHubClient({ token }).getIssue("owner/repo", 5);
+    expect(r).toEqual({ number: 5, state: "open", title: "T", body: "", author: "luci", assignees: ["a", "b"], isPullRequest: false });
+    expect(calls[0]).toMatchObject({ url: "https://api.github.com/repos/owner/repo/issues/5", method: "GET" });
+  });
+
+  it("getIssue flags pull requests", async () => {
+    capture(200, { number: 6, state: "closed", title: "PR", body: "x", user: { login: "u" }, assignees: [], pull_request: { url: "u" } });
+    const r = await new GitHubClient({ token }).getIssue("owner/repo", 6);
+    expect(r.isPullRequest).toBe(true);
+    expect(r.body).toBe("x");
+  });
+
+  it("getIssue throws on 404", async () => {
+    capture(404, { message: "Not Found" });
+    await expect(new GitHubClient({ token }).getIssue("owner/repo", 99)).rejects.toThrow("getIssue 404");
+  });
+
+  it("addAssignees posts the logins", async () => {
+    const calls = capture(201, {});
+    await expect(new GitHubClient({ token }).addAssignees("owner/repo", 7, ["bot"])).resolves.toBeUndefined();
+    expect(calls[0]).toEqual({ url: "https://api.github.com/repos/owner/repo/issues/7/assignees", method: "POST", payload: { assignees: ["bot"] } });
+  });
+
+  it("addAssignees throws on 4xx", async () => {
+    capture(403, { message: "Forbidden" });
+    await expect(new GitHubClient({ token }).addAssignees("owner/repo", 7, ["bot"])).rejects.toThrow("addAssignees 403");
+  });
 });
