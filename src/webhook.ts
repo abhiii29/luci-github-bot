@@ -6,6 +6,7 @@ import { ResourceStats } from "./resource-monitor.js";
 import { metrics } from "./metrics.js";
 import { JsonQueueStore } from "./store.js";
 import { parseDirectives } from "./directives.js";
+import { checkCollaborator, clearCollaboratorCache } from "./collaborators.js";
 import { loadRepoConfig } from "./repo-config.js";
 import { logger } from "./logger.js";
 import { redact } from "./redact.js";
@@ -15,10 +16,6 @@ let dockerWorker: DockerWorker | null = null;
 type RetryHandler = (event: GitHubIssueEvent) => Promise<void>;
 let retryHandler: RetryHandler | null = null;
 let queueStore: JsonQueueStore | null = null;
-
-/** Cached result of collaborator/owner checks. */
-const collaboratorCache = new Map<string, { isCollab: boolean; timestamp: number }>();
-const COLLABORATOR_CACHE_TTL_MS = 300_000; // 5 min
 
 const repoConfigCache = new Map<string, { result: import("./repo-config.js").RepoConfigResult; timestamp: number }>();
 const REPO_CONFIG_CACHE_TTL_MS = 300_000;
@@ -38,40 +35,8 @@ export function setQueueStore(store: JsonQueueStore): void {
 export function __resetWebhookState(): void {
   handlers.length = 0;
   retryHandler = null;
-  collaboratorCache.clear();
+  clearCollaboratorCache();
   repoConfigCache.clear();
-}
-
-/** Check whether a user is a collaborator/owner of a repo (cached). */
-async function checkCollaborator(
-  githubToken: string,
-  repoFullName: string,
-  username: string
-): Promise<boolean> {
-  const now = Date.now();
-  const cacheKey = `${repoFullName}:${username}`;
-  const cached = collaboratorCache.get(cacheKey);
-  if (cached && now - cached.timestamp < COLLABORATOR_CACHE_TTL_MS) {
-    return cached.isCollab;
-  }
-
-  try {
-    const res = await fetch(
-      `https://api.github.com/repos/${repoFullName}/collaborators/${username}`,
-      {
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          Accept: "application/vnd.github.v3+json",
-        },
-      }
-    );
-    const isCollab = res.ok;
-    collaboratorCache.set(cacheKey, { isCollab, timestamp: now });
-    return isCollab;
-  } catch {
-    collaboratorCache.set(cacheKey, { isCollab: false, timestamp: now });
-    return false;
-  }
 }
 
 export type HealthStats = {

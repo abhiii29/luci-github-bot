@@ -152,7 +152,7 @@ export function validateSolution(
   commitMessage: string,
   files: Array<{ path: string; content: string; operation: string }>,
   opts?: ValidateSolutionOptions
-): { valid: true } | { valid: false; errors: SolutionValidationError[] } {
+): { valid: true; errors: []; warnings: [] } | { valid: false; errors: SolutionValidationError[] } {
   const options = { ...DEFAULT_OPTIONS, ...opts };
   const errors: SolutionValidationError[] = [];
 
