@@ -38,7 +38,7 @@ describe("DynamicSemaphore", () => {
     const s = new DynamicSemaphore(2);
     await s.acquire();
     await s.acquire();
-    s.adjustByCapacity(0.5); // limit 1, 2 in use
+    s.adjustByCapacity(0.3); // limit 1, 2 in use
     let waiter = false;
     void s.acquire().then(() => (waiter = true));
     s.release(); // 1 in use, limit 1 -> still full
@@ -57,5 +57,15 @@ describe("DynamicSemaphore", () => {
     s.adjustByCapacity(1);
     await tick();
     expect(admitted).toBe(3);
+  });
+});
+
+describe("DynamicSemaphore under load", () => {
+  it("keeps one slot while below the thresholds (live: 80% memory with an 85% threshold gave 0 slots)", () => {
+    const s = new DynamicSemaphore(1);
+    s.adjustByCapacity(0.06);
+    expect(s.getAvailable()).toBe(1);
+    s.adjustByCapacity(0);
+    expect(s.getAvailable()).toBe(0);
   });
 });

@@ -110,7 +110,9 @@ export class DynamicSemaphore {
    * it again (pressure gone) immediately lets waiting jobs start.
    */
   adjustByCapacity(capacity: number): void {
-    this.limit = Math.min(this.max, Math.max(0, Math.round(capacity * this.max)));
+    // Scale down with load, but keep one slot until a threshold is actually exceeded (capacity 0);
+    // otherwise a single-worker bot stops at ~50% memory use.
+    this.limit = capacity <= 0 ? 0 : Math.min(this.max, Math.max(1, Math.round(capacity * this.max)));
     this.wake();
   }
 
