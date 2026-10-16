@@ -457,5 +457,9 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
     res.json(metrics.getRecentActivity(Math.min(limit, 100)));
   });
 
+  app.get("/version", (_req, res) => {
+    res.json({ name: "luci-github-bot", version: "0.1.0" });
+  });
+
   return app;
 }
