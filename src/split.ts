@@ -10,7 +10,7 @@ export const PART_MARKER = "<!-- luci-bot:part";
 export const PARTS_MARKER = "<!-- luci-bot:parts";
 
 export function partIssueBody(
-  parent: { number: number; title: string },
+  parent: { number: number; title: string; body?: string },
   part: PlanPart,
   index: number,
   total: number,
@@ -25,6 +25,13 @@ export function partIssueBody(
   }
   if (previous !== undefined) {
     lines.push(`Depends on #${previous} (merged first).`);
+  }
+  if (parent.body?.trim()) {
+    // The model only sees this issue, so carry the parent's full spec; it implements this part's scope only.
+    lines.push("");
+    lines.push(`Implement ONLY the scope and files above. Full spec of #${parent.number}, for reference:`);
+    lines.push("");
+    lines.push(...parent.body.trim().split("\n").map((l) => `> ${l}`));
   }
   lines.push("");
   lines.push(`${PART_MARKER} parent=${parent.number} index=${index} total=${total} -->`);
@@ -57,7 +64,7 @@ export function parsePartsComment(body: string): number[] | null {
 export async function createSplitIssues(
   gh: SplitGitHub,
   repo: string,
-  parent: { number: number; title: string },
+  parent: { number: number; title: string; body?: string },
   parts: PlanPart[],
   botUsername: string
 ): Promise<number[]> {

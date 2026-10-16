@@ -62,7 +62,7 @@ export function buildCommandHooks(e: GitHubCommentEvent): CommandHooks {
       if (state.plan.parts && state.plan.parts.length >= 2) {
         const config = getConfig();
         const gh = new GitHubClient({ token: config.githubToken, retries: 2 });
-        const numbers = await createSplitIssues(gh, repo, { number: n, title: e.issue.title }, state.plan.parts, config.botUsername ?? "");
+        const numbers = await createSplitIssues(gh, repo, { number: n, title: e.issue.title, body: e.issue.body ?? "" }, state.plan.parts, config.botUsername ?? "");
         return `@${u} split into ${numbers.length} sub-issues: ${numbers.map((x) => "#" + x).join(", ")}. Part 1 (#${numbers[0]}) has been assigned and starts now.`;
       }
       const files = state.plan.files.map((f) => f.path);

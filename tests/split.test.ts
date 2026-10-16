@@ -36,6 +36,13 @@ describe("split", () => {
     });
   });
 
+  it("quotes the parent spec when given", () => {
+    const body = partIssueBody({ ...parent, body: "Export foo()\nand bar()" }, parts[0], 1, 2);
+    expect(body).toContain("Implement ONLY the scope and files above.");
+    expect(body).toContain("> Export foo()\n> and bar()");
+    expect(parsePartMarker(body)).toEqual({ parent: 100, index: 1, total: 2 });
+  });
+
   describe("partsComment & parsePartsComment", () => {
     it("round trips correctly", () => {
       const comment = partsComment([101, 102, 103]);
