@@ -34,7 +34,10 @@ export async function setupBot(config: Config, store: JsonQueueStore): Promise<B
   queue.setProcessor(async (job) => {
     const event = eventFromJob(job);
     if (!event) return { success: false, error: "invalid_job_payload", retryable: false };
-    return handleIssue(event, { isCancelled: () => isJobCancelled(job.id) });
+    return handleIssue(event, {
+      isCancelled: () => isJobCancelled(job.id),
+      willRetry: job.attempts < job.maxAttempts, // attempts is incremented when the job is claimed
+    });
   });
   initDispatch(store, queue);
 

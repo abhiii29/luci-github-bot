@@ -11,6 +11,7 @@ import {
 } from "./llm.js";
 import { guardChanges } from "./change-guard.js";
 import { withUsage, currentUsage, formatUsage } from "./usage.js";
+import { addSample, estimateMs, formatEstimate, loadStats, saveStats, type ModelAction, type TimingStats } from "./timing.js";
 import { DockerWorker, type WorkerProgress } from "./docker-worker.js";
 import { getConfig } from "./config.js";
 import { metrics } from "./metrics.js";
@@ -36,6 +37,8 @@ function getWorker(): DockerWorker {
 export interface HandleContext {
   /** Returns true once the job was cancelled (`/luci cancel`); checked before anything is pushed. */
   isCancelled?: () => boolean;
+  /** The queue will run this job again if it fails retryably. */
+  willRetry?: boolean;
 }
 
 // ── GitHub helpers (never throw: a failed comment must not fail the job) ──
@@ -253,6 +256,22 @@ async function handleIssueInner(event: GitHubIssueEvent, ctx: HandleContext): Pr
     const repoContext = await buildRepoContext(githubToken, repoFullName, event.issue.title, body + hintText);
     console.log(`[handler] ${issueKey}: ${repoContext.fileCount} file(s) of context, model=${useLocal ? "local" : "remote"}`);
 
+    // Show how long the model step usually takes (learned per repo), and learn from this run.
+    const model = useLocal ? config.ollamaModel : config.adassoModel;
+    const botLogin = config.botUsername ?? "";
+    let stats: TimingStats | undefined;
+    const timed = async <T>(action: ModelAction, label: string, fn: () => Promise<T>): Promise<T> => {
+      stats ??= await loadStats(gh, repoFullName, botLogin);
+      const estimate = estimateMs(stats, model, action, Math.round(repoContext.promptSection.length / 4));
+      await updateStatusComment(gh, repoFullName, issueNumber, "working", { hint: `${label} with ${model} (${formatEstimate(estimate)})`, notes });
+      const started = Date.now();
+      const outBefore = currentUsage()?.outputTokens ?? 0;
+      const result = await fn(); // failed calls are not samples
+      stats = addSample(stats, model, action, Date.now() - started, (currentUsage()?.outputTokens ?? 0) - outBefore);
+      await saveStats(gh, repoFullName, botLogin, stats);
+      return result;
+    };
+
     // ── Plan stage: post a plan and stop until a collaborator says `/luci go` ──
     if (opts.planOnly && !opts.approvedPlanFiles) {
       const { plan } = await createPlan(
@@ -261,7 +280,7 @@ async function handleIssueInner(event: GitHubIssueEvent, ctx: HandleContext): Pr
         body,
         repoFullName,
         issueNumber,
-        () => generatePlanText(event.issue.title, body || "(no description)", repoContext.promptSection, useLocal)
+        () => timed("plan", "planning", () => generatePlanText(event.issue.title, body || "(no description)", repoContext.promptSection, useLocal))
       );
       if (plan.plan.files.length === 0 && (!plan.plan.parts || plan.plan.parts.length < 2)) {
         return await fail("plan_empty", "The model could not produce a usable plan. Add detail to the issue and reply `/luci plan`.", false);
@@ -279,25 +298,32 @@ async function handleIssueInner(event: GitHubIssueEvent, ctx: HandleContext): Pr
     let solution: CodeGenerationResult;
     try {
     if (useLocal) {
-      solution = await generateSolutionWithDecomposition(
-        event.issue.title,
-        extractLocalPrompt(event.issue.title, body || undefined) + hintText + scopeNote,
-        repoContext.promptSection,
-        [],
-        githubToken,
-        repoFullName
+      solution = await timed("code", "writing code", () =>
+        generateSolutionWithDecomposition(
+          event.issue.title,
+          extractLocalPrompt(event.issue.title, body || undefined) + hintText + scopeNote,
+          repoContext.promptSection,
+          [],
+          githubToken,
+          repoFullName
+        )
       );
     } else {
-      solution = await generateSolution(
-        event.issue.title,
-        (body || "(no description)") + hintText + scopeNote,
-        repoContext.promptSection
+      solution = await timed("code", "writing code", () =>
+        generateSolution(event.issue.title, (body || "(no description)") + hintText + scopeNote, repoContext.promptSection)
       );
     }
     } catch (err) {
       const msg = redact(err instanceof Error ? err.message : String(err));
       if (isModelUnavailable(err)) {
         metrics.recordLlmGeneration(false, useLocal);
+        if (ctx.willRetry) {
+          // Not a failure yet: say when the next attempt happens instead of showing "Failed".
+          console.error(`[issue-handler] ${issueKey} model unavailable, will retry: ${msg}`);
+          const retryAt = new Date(Date.now() + MODEL_RETRY_DELAY_MS).toISOString().slice(11, 16);
+          await updateStatusComment(gh, repoFullName, issueNumber, "retrying", { hint: retryAt, notes });
+          return { success: false, error: "model_unavailable", retryable: true, retryDelayMs: MODEL_RETRY_DELAY_MS };
+        }
         const out = await fail(
           "model_unavailable",
           `The ${useLocal ? "local" : "remote"} model is not reachable right now. The bot will retry in a few minutes.`,
