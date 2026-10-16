@@ -182,16 +182,16 @@ class PodmanRuntime implements ContainerRuntime {
     });
   }
 
-  private async runWithOutput(args: string[], opts?: { timeout?: number; env?: Record<string, string> }): Promise<string> {
+  private async runWithOutput(args: string[], opts?: { timeout?: number; env?: Record<string, string>; includeStderr?: boolean }): Promise<string> {
     return new Promise((resolve, reject) => {
       const timeout = opts?.timeout ?? 300_000;
       execFile(
         "podman",
         args,
         { timeout, maxBuffer: 10 * 1024 * 1024, env: opts?.env ? { ...process.env, ...opts.env } : process.env },
-        (err, stdout) => {
+        (err, stdout, stderr) => {
           if (err) reject(err);
-          else resolve(stdout.toString());
+          else resolve(opts?.includeStderr ? `${stdout}${stderr}` : stdout.toString());
         }
       );
     });
@@ -225,7 +225,8 @@ class PodmanRuntime implements ContainerRuntime {
   }
 
   async logs(containerId: string) {
-    return this.runWithOutput(["logs", containerId]);
+    // `logs` writes the container's stderr to its own stderr: capture both, or errors vanish
+    return this.runWithOutput(["logs", containerId], { includeStderr: true });
   }
 
   async inspect(containerId: string) {
@@ -291,11 +292,11 @@ class DockerRuntime implements ContainerRuntime {
     });
   }
 
-  private async runWithOutput(args: string[], opts?: { timeout?: number; env?: Record<string, string> }): Promise<string> {
+  private async runWithOutput(args: string[], opts?: { timeout?: number; env?: Record<string, string>; includeStderr?: boolean }): Promise<string> {
     return new Promise((resolve, reject) => {
-      execFile("docker", args, { timeout: opts?.timeout ?? 300_000, maxBuffer: 10 * 1024 * 1024, env: opts?.env ? { ...process.env, ...opts.env } : process.env }, (err, stdout) => {
+      execFile("docker", args, { timeout: opts?.timeout ?? 300_000, maxBuffer: 10 * 1024 * 1024, env: opts?.env ? { ...process.env, ...opts.env } : process.env }, (err, stdout, stderr) => {
         if (err) reject(err);
-        else resolve(stdout.toString());
+        else resolve(opts?.includeStderr ? `${stdout}${stderr}` : stdout.toString());
       });
     });
   }
@@ -327,7 +328,8 @@ class DockerRuntime implements ContainerRuntime {
   }
 
   async logs(containerId: string) {
-    return this.runWithOutput(["logs", containerId]);
+    // `logs` writes the container's stderr to its own stderr: capture both, or errors vanish
+    return this.runWithOutput(["logs", containerId], { includeStderr: true });
   }
 
   async inspect(containerId: string) {
@@ -530,7 +532,7 @@ export class DockerWorker {
       if (opts.baseBranch) env.BASE_BRANCH = opts.baseBranch;
       if (opts.noPr) env.NO_PR = "1";
       if (config.gitBaseUrl) env.GIT_BASE_URL = config.gitBaseUrl;
-      if (config.githubApiUrl) env.API_BASE_URL = config.githubApiUrl;
+      env.API_BASE_URL = config.githubApiUrl ?? "https://api.github.com";
 
       const args: string[] = [];
       if (config.containerMemory) args.push("--memory", config.containerMemory);

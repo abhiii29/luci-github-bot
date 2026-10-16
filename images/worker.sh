@@ -20,6 +20,7 @@ set -euo pipefail
 SOLUTION_FILE="${SOLUTION_FILE:-/tmp/.luci-solution.json}"
 GIT_BASE_URL="${GIT_BASE_URL:-https://github.com}"
 API_BASE_URL="${API_BASE_URL:-https://api.github.com}"
+export GIT_BASE_URL API_BASE_URL  # node (PR creation) reads these from the environment
 
 # Print the RESULT line using node so values are JSON-escaped correctly.
 # usage: emit_result <status> [key value]...
