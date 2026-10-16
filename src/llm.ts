@@ -296,7 +296,7 @@ export async function generatePlanText(
     );
   }
   const apiKey = await getAdessoApiKey();
-  return adessoChat(apiKey, config.adassoBaseUrl, config.adassoModel, prompt.system, prompt.user, 3000);
+  return adessoChat(apiKey, config.adassoBaseUrl, config.adassoModel, prompt.system, prompt.user, 8000);
 }
 
 // ---------------------------------------------------------------------------
