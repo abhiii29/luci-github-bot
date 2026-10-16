@@ -320,3 +320,41 @@ export function parsePlanOutput(raw: string, _issueBody: string): Plan {
     createdAt: new Date().toISOString(),
   };
 }
+
+/** All stored plans (for the dashboard). Expiry is applied on read. */
+export function listPlans(ttlMs: number = DEFAULT_TTL_MS): Array<{
+  repo: string;
+  issueNumber: number;
+  status: PlanState["status"];
+  createdAt: string;
+  approvedBy?: string;
+  files: PlanFile[];
+  approach: string;
+}> {
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(getPlanDir()).filter((n) => n.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    const m = name.match(/^(.+?)__(.+)__(\d+)\.json$/);
+    const state = readPlanState(name.replace(/\.json$/, ""));
+    if (!m || !state) continue;
+    const status = state.status === "pending" && isPlanExpired(state, ttlMs) ? "expired" : state.status;
+    // The key stores "owner/repo" with "/" replaced by "-": the owner prefix tells us where it was.
+    const owner = m[1];
+    const repo = m[2].startsWith(owner + "-") ? `${owner}/${m[2].slice(owner.length + 1)}` : m[2];
+    out.push({
+      repo,
+      issueNumber: Number(m[3]),
+      status,
+      createdAt: state.plan.createdAt,
+      approvedBy: state.approvedBy,
+      files: state.plan.files,
+      approach: state.plan.approach,
+    });
+  }
+  return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}

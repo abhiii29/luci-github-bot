@@ -245,7 +245,9 @@ beforeEach(async () => {
     return handler.handleIssue(event!, { isCancelled: () => dispatch.isJobCancelled(job.id) });
   });
   dispatch.initDispatch(store, queue);
-  handler.setIssueWorker(new (DockerWorker as any)());
+  const worker = new (DockerWorker as any)();
+  handler.setIssueWorker(worker);
+  (await import("../../src/webhook.js")).setDockerWorker(worker);
   webhook.__resetWebhookState();
   webhook.setQueueStore(store);
   webhook.onQueued(handler.markIssueQueued);
@@ -475,5 +477,42 @@ describe("/luci commands", () => {
     await comment(43, "/luci go");
     await settle();
     expect(runs).toHaveLength(0);
+  });
+});
+
+describe("dashboard", () => {
+  it("serves the page with a strict CSP and no data in it", async () => {
+    const res = await request(app).get("/dashboard");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-security-policy"]).toContain("default-src 'none'");
+    expect(res.headers["content-security-policy"]).toContain("connect-src 'self'");
+    expect(res.text).toContain("<title>luci-github-bot</title>");
+    expect(res.text).not.toContain(REPO);
+  });
+
+  it("overview, jobs and plans are behind /api auth from outside", async () => {
+    for (const p of ["/api/overview", "/api/jobs", "/api/plans"]) {
+      expect((await request(app).get(p).set("X-Forwarded-For", "203.0.113.9")).status).toBe(403);
+    }
+  });
+
+  it("jobs show the issue title but never the payload", async () => {
+    await assign(50, { title: "<img src=x onerror=alert(1)>", body: "secret-ish body text" });
+    await settle();
+    const res = await request(app).get("/api/jobs");
+    const job = res.body.jobs.find((j: any) => j.issueNumber === 50);
+    expect(job.title).toBe("<img src=x onerror=alert(1)>"); // rendered with textContent by the page
+    expect(JSON.stringify(res.body)).not.toContain("secret-ish body text");
+  });
+
+  it("overview reports job counts and capacity; plans lists stored plans", async () => {
+    await comment(51, "/luci plan");
+    await settle();
+    const o = (await request(app).get("/api/overview")).body;
+    expect(o.jobCounts.no_op).toBeGreaterThanOrEqual(1);
+    expect(o.capacity).toEqual({ available: 1, max: 1, full: false });
+    expect(o.repos).toEqual([REPO]);
+    const plans = (await request(app).get("/api/plans")).body.plans;
+    expect(plans.find((p: any) => p.issueNumber === 51)).toMatchObject({ repo: REPO, status: "pending" });
   });
 });

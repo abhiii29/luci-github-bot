@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>luci-github-bot</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%235b6cf0'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5f6b7a; --border: #e3e6ea;
+    --accent: #5b6cf0; --ok: #1a7f4b; --ok-bg: #e6f4ec; --warn: #9a6200; --warn-bg: #fdf3dd;
+    --bad: #b42318; --bad-bg: #fde8e7; --info: #2f5bd3; --info-bg: #e8eefc; --neutral-bg: #eef0f3;
+    --bar: #dfe3e8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --panel: #171b21; --text: #e6e9ed; --muted: #95a0ad; --border: #262c34;
+      --accent: #8b97ff; --ok: #4cc38a; --ok-bg: #12301f; --warn: #e3b341; --warn-bg: #33270b;
+      --bad: #f47067; --bad-bg: #3a1513; --info: #79a2ff; --info-bg: #15213d; --neutral-bg: #222830;
+      --bar: #2a313a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216; --panel: #171b21; --text: #e6e9ed; --muted: #95a0ad; --border: #262c34;
+    --accent: #8b97ff; --ok: #4cc38a; --ok-bg: #12301f; --warn: #e3b341; --warn-bg: #33270b;
+    --bad: #f47067; --bad-bg: #3a1513; --info: #79a2ff; --info-bg: #15213d; --neutral-bg: #222830;
+    --bar: #2a313a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 18px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .meta { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .spacer { flex: 1; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; background: var(--neutral-bg); color: var(--muted); white-space: nowrap; }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); }
+  .pill.info { background: var(--info-bg); color: var(--info); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(130px, 100%), 1fr)); gap: 10px; margin-bottom: 14px; }
+  .tile .label { color: var(--muted); font-size: 12px; }
+  .tile .value { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .sub { color: var(--muted); font-size: 12px; }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 14px; }
+  .grid2 > *, .tiles > * { min-width: 0; }
+  .meta { overflow-wrap: anywhere; }
+  .title, .repo { overflow-wrap: break-word; }
+  td.issue { min-width: 160px; }
+  @media (max-width: 600px) { .col-attempts, .col-updated { display: none; } .tile .value { font-size: 20px; } }
+  @media (max-width: 820px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .tabs button { border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 999px;
+    padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  .tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .title { display: block; color: var(--text); }
+  .repo { color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); padding: 18px 8px; text-align: center; }
+  .bar { height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; margin: 4px 0 10px; }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+  .kv { display: flex; justify-content: space-between; font-size: 13px; }
+  .plan { border-top: 1px solid var(--border); padding: 10px 0; }
+  .plan:first-of-type { border-top: 0; padding-top: 0; }
+  .plan ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .stack { display: grid; gap: 14px; }
+  #auth { max-width: 420px; margin: 12vh auto 0; }
+  #auth input { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--text); font: inherit; margin: 10px 0; }
+  #auth button, .btn { padding: 7px 14px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  .btn.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); padding: 3px 10px; font-size: 12px; }
+  .error { color: var(--bad); font-size: 13px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <section id="auth" class="panel" hidden>
+    <h1>luci-github-bot</h1>
+    <p class="meta">This dashboard reads the bot's <code>/api</code>. Enter the <code>API_TOKEN</code> from the bot's <code>.env</code>. It is kept for this browser tab only.</p>
+    <form id="auth-form">
+      <input id="token" type="password" autocomplete="off" placeholder="API_TOKEN" aria-label="API token">
+      <button type="submit">Open dashboard</button>
+      <p id="auth-error" class="error" hidden></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <header>
+      <h1>luci-github-bot</h1>
+      <span id="status" class="pill">loading</span>
+      <span id="dryrun" class="pill warn" hidden>dry run</span>
+      <span class="spacer"></span>
+      <span class="meta"><span id="updated"></span></span>
+      <button id="logout" class="btn ghost" hidden>Forget token</button>
+    </header>
+    <div class="meta" style="margin:-8px 0 16px"><span id="bot"></span><span id="repos"></span><span id="uptime"></span></div>
+
+    <div class="tiles" id="tiles"></div>
+
+    <div class="grid2">
+      <section class="panel">
+        <h2>Jobs</h2>
+        <div class="tabs" id="tabs" role="group" aria-label="Filter jobs"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Issue</th><th>Status</th><th class="col-attempts">Attempts</th><th class="col-updated">Updated</th><th>Result</th></tr></thead>
+            <tbody id="jobs"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="stack">
+        <section class="panel">
+          <h2>Workers</h2>
+          <div id="capacity"></div>
+        </section>
+        <section class="panel">
+          <h2>Model</h2>
+          <div id="llm"></div>
+        </section>
+        <section class="panel">
+          <h2>Plans</h2>
+          <div id="plans"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const STATUSES = ["all", "queued", "running", "succeeded", "failed", "no_op", "cancelled"];
+  const STATUS_STYLE = { queued: "info", running: "info", succeeded: "ok", failed: "bad", no_op: "", cancelled: "",
+    pending: "warn", approved: "info", executed: "ok", expired: "", ok: "ok", degraded: "warn" };
+  const LABEL = { no_op: "no change", all: "All" };
+  let token = null;
+  let filter = "all";
+  let timer = null;
+  let lastJobs = [];
+
+  try { token = sessionStorage.getItem("luci-token"); } catch {}
+  try { filter = localStorage.getItem("luci-filter") || "all"; } catch {}
+
+  // ── helpers (all data is rendered with textContent: issue titles are untrusted) ──
+  const $ = (id) => document.getElementById(id);
+  function el(tag, attrs, ...children) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === "class") n.className = v; else n.setAttribute(k, v);
+    }
+    for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) n.append(c instanceof Node ? c : String(c));
+    return n;
+  }
+  const pill = (text, kind) => el("span", { class: "pill " + (kind || "") }, text);
+  const safeUrl = (u) => (typeof u === "string" && /^https:\/\/github\.com\//.test(u) ? u : null);
+  const link = (href, text) => (href ? el("a", { href, target: "_blank", rel: "noopener noreferrer" }, text) : text);
+  function ago(iso) {
+    if (!iso) return "—";
+    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return Math.round(s) + "s ago";
+    if (s < 3600) return Math.round(s / 60) + "m ago";
+    if (s < 86400) return Math.round(s / 3600) + "h ago";
+    return Math.round(s / 86400) + "d ago";
+  }
+  function duration(sec) {
+    if (!sec && sec !== 0) return "";
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+    return h ? `${h}h ${m}m` : `${m}m`;
+  }
+  const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+
+  async function api(path) {
+    const headers = token ? { Authorization: "Bearer " + token } : {};
+    const res = await fetch(path, { headers, cache: "no-store" });
+    if (res.status === 401 || res.status === 403) throw Object.assign(new Error("auth"), { auth: true });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }
+
+  // ── rendering ──
+  function renderOverview(o) {
+    const st = $("status");
+    st.className = "pill " + (STATUS_STYLE[o.status] || "");
+    st.textContent = o.status === "ok" ? "running" : o.status;
+    $("dryrun").hidden = !o.dryRun;
+    $("bot").textContent = "bot: @" + o.botUsername;
+    $("repos").textContent = o.repos.length + (o.repos.length === 1 ? " repo" : " repos") + ": " + o.repos.join(", ");
+    $("uptime").textContent = "up " + duration(o.uptimeSeconds);
+
+    const c = o.jobCounts || {};
+    const finished = (c.succeeded || 0) + (c.failed || 0);
+    const tiles = [
+      ["Queued", c.queued || 0, "waiting for a slot"],
+      ["Running", c.running || 0, o.capacity ? `${o.capacity.max - o.capacity.available}/${o.capacity.max} slots busy` : ""],
+      ["PRs opened", c.succeeded || 0, finished ? pct(c.succeeded || 0, finished) + "% success" : "no finished jobs"],
+      ["Failed", c.failed || 0, "after retries"],
+      ["No change", c.no_op || 0, "plans, dry runs, no-ops"],
+    ];
+    $("tiles").replaceChildren(...tiles.map(([label, value, sub]) =>
+      el("div", { class: "panel tile" }, el("div", { class: "label" }, label), el("div", { class: "value" }, value), el("div", { class: "sub" }, sub))));
+
+    const r = o.resources || {};
+    const cap = o.capacity || { available: 0, max: 0 };
+    $("capacity").replaceChildren(
+      el("div", { class: "kv" }, el("span", {}, "Slots in use"), el("strong", {}, `${cap.max - cap.available} / ${cap.max}`)),
+      el("div", { class: "bar" }, el("span", { style: `width:${pct(cap.max - cap.available, cap.max)}%` })),
+      el("div", { class: "kv" }, el("span", {}, "Host CPU"), el("span", {}, r.cpuUsagePercent != null ? Math.round(r.cpuUsagePercent) + "%" : "—")),
+      el("div", { class: "bar" }, el("span", { style: `width:${Math.min(100, Math.round(r.cpuUsagePercent || 0))}%` })),
+      el("div", { class: "kv" }, el("span", {}, "Host memory"), el("span", {}, r.memoryUsedPercent != null ? Math.round(r.memoryUsedPercent) + "%" : "—")),
+      el("div", { class: "bar" }, el("span", { style: `width:${Math.min(100, Math.round(r.memoryUsedPercent || 0))}%` })),
+    );
+
+    const l = o.llm || {};
+    const w = o.workers || {};
+    $("llm").replaceChildren(
+      el("div", { class: "kv" }, el("span", {}, "Generations"), el("strong", {}, `${l.success || 0} ok / ${l.failed || 0} failed`)),
+      el("div", { class: "kv" }, el("span", {}, "Remote · local"), el("span", {}, `${l.remoteModelUsed || 0} · ${l.localModelUsed || 0}`)),
+      el("div", { class: "kv" }, el("span", {}, "Container runs"), el("span", {}, `${w.success || 0} ok / ${w.failed || 0} failed`)),
+      el("p", { class: "meta", style: "margin:8px 0 0" }, "Since the bot started."),
+    );
+  }
+
+  function renderTabs(jobs) {
+    const counts = Object.fromEntries(STATUSES.map((s) => [s, s === "all" ? jobs.length : jobs.filter((j) => j.status === s).length]));
+    $("tabs").replaceChildren(...STATUSES.filter((s) => s === "all" || counts[s] > 0 || s === filter).map((s) => {
+      const b = el("button", { type: "button", "aria-pressed": String(s === filter) }, `${LABEL[s] || s} ${counts[s]}`);
+      b.addEventListener("click", () => {
+        filter = s;
+        try { localStorage.setItem("luci-filter", s); } catch {}
+        renderTabs(lastJobs);
+        renderJobs(lastJobs);
+      });
+      return b;
+    }));
+  }
+
+  function renderJobs(jobs) {
+    const rows = jobs
+      .filter((j) => filter === "all" || j.status === filter)
+      .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""))
+      .map((j) => {
+        const issueUrl = `https://github.com/${j.repo}/issues/${j.issueNumber}`;
+        const result = j.prUrl ? link(safeUrl(j.prUrl), "View PR") : j.errorCategory ? el("code", {}, j.errorCategory) : "—";
+        return el("tr", {},
+          el("td", { class: "issue" }, link(issueUrl, el("span", { class: "title" }, j.title || `#${j.issueNumber}`)),
+            el("span", { class: "repo" }, `${j.repo} #${j.issueNumber}`)),
+          el("td", {}, pill(LABEL[j.status] || j.status, STATUS_STYLE[j.status])),
+          el("td", { class: "num col-attempts" }, `${j.attempts}/${j.maxAttempts}`),
+          el("td", { class: "num col-updated", title: j.updatedAt }, ago(j.updatedAt)),
+          el("td", {}, result));
+      });
+    $("jobs").replaceChildren(...(rows.length ? rows : [el("tr", {}, el("td", { colspan: "5", class: "empty" },
+      filter === "all" ? "No jobs yet. Assign an issue to the bot to start one." : "No jobs with this status."))]));
+  }
+
+  function renderPlans(plans) {
+    const shown = plans.slice(0, 8);
+    $("plans").replaceChildren(...(shown.length ? shown.map((p) =>
+      el("div", { class: "plan" },
+        el("div", { class: "kv" },
+          link(`https://github.com/${p.repo}/issues/${p.issueNumber}`, `${p.repo} #${p.issueNumber}`),
+          pill(p.status, STATUS_STYLE[p.status])),
+        el("div", { class: "meta" }, `${p.files.length} file(s) · ${ago(p.createdAt)}` + (p.approvedBy ? ` · approved by @${p.approvedBy}` : "")),
+        el("ul", {}, ...p.files.slice(0, 5).map((f) => el("li", {}, el("code", {}, f.path), ` (${f.operation})`))))) :
+      [el("p", { class: "meta", style: "margin:0" }, "No plans. Comment /luci plan on an issue.")]));
+  }
+
+  // ── loop ──
+  async function refresh() {
+    try {
+      const [overview, jobs, plans] = await Promise.all([api("/api/overview"), api("/api/jobs"), api("/api/plans")]);
+      $("auth").hidden = true;
+      $("app").hidden = false;
+      $("logout").hidden = !token;
+      lastJobs = jobs.jobs || [];
+      renderOverview(overview);
+      renderTabs(lastJobs);
+      renderJobs(lastJobs);
+      renderPlans(plans.plans || []);
+      $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+    } catch (err) {
+      if (err.auth) {
+        stop();
+        $("app").hidden = true;
+        $("auth").hidden = false;
+        if (token) {
+          $("auth-error").textContent = "That token was not accepted.";
+          $("auth-error").hidden = false;
+        }
+        $("token").focus();
+        return;
+      }
+      $("updated").textContent = "offline — retrying";
+      const st = $("status");
+      st.className = "pill bad";
+      st.textContent = "unreachable";
+    }
+  }
+  function start() { stop(); refresh(); timer = setInterval(() => { if (!document.hidden) refresh(); }, 5000); }
+  function stop() { if (timer) clearInterval(timer); timer = null; }
+
+  $("auth-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    token = $("token").value.trim() || null;
+    try { token ? sessionStorage.setItem("luci-token", token) : sessionStorage.removeItem("luci-token"); } catch {}
+    $("auth-error").hidden = true;
+    start();
+  });
+  $("logout").addEventListener("click", () => {
+    token = null;
+    try { sessionStorage.removeItem("luci-token"); } catch {}
+    start();
+  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+  start();
+})();
+</script>
+</body>
+</html>

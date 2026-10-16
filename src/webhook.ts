@@ -1,3 +1,6 @@
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import crypto from "crypto";
 import express, { Request, Response, NextFunction } from "express";
 import { getConfig } from "./config.js";
@@ -8,6 +11,7 @@ import { JsonQueueStore } from "./store.js";
 import { clearCollaboratorCache } from "./collaborators.js";
 import { computeJobOptions, clearRepoConfigCache } from "./job-context.js";
 import { enqueueIssue, isDispatchReady, openJobFor } from "./dispatch.js";
+import { listPlans } from "./plan.js";
 import type { GitHubCommentEvent } from "./command-handler.js";
 import type { ResolvedJobOptions } from "./job-options.js";
 import { logger } from "./logger.js";
@@ -383,6 +387,17 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
     })
   );
 
+  // Dashboard: a static page with no data in it. It reads /api/*, so the same auth applies.
+  const dashboardHtml = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public", "dashboard.html"), "utf-8");
+  app.get(["/", "/dashboard"], (_req: Request, res: Response) => {
+    res
+      .type("html")
+      .set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+      .set("X-Content-Type-Options", "nosniff")
+      .set("Referrer-Policy", "no-referrer")
+      .send(dashboardHtml);
+  });
+
   // Health check endpoint (public, coarse info only)
   app.get("/health", (_req: Request, res: Response) => {
     const stats = getHealthStats();
@@ -397,6 +412,29 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
     res.json(metrics.getSnapshot());
   });
 
+  // Everything the dashboard's header needs in one call
+  app.get("/api/overview", (_req: Request, res: Response) => {
+    const health = getHealthStats();
+    const m = metrics.getSnapshot();
+    res.json({
+      status: health.status,
+      capacity: health.capacity,
+      resources: health.resources,
+      uptimeSeconds: m.uptimeSeconds,
+      startTime: m.startTime,
+      jobCounts: queueStore?.getJobCountByStatus() ?? null,
+      llm: m.llmGenerations,
+      workers: m.workerExecutions,
+      repos: appConfig.monitoredRepos,
+      botUsername: appConfig.botUsername,
+      dryRun: !!appConfig.dryRun,
+    });
+  });
+
+  app.get("/api/plans", (_req: Request, res: Response) => {
+    res.json({ plans: listPlans() });
+  });
+
   // Jobs endpoint (no payloads: they contain issue text)
   app.get("/api/jobs", (req: Request, res: Response) => {
     if (!queueStore) return res.json({ jobs: [], queueDepth: 0 });
@@ -405,7 +443,11 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
       .getSnapshot()
       .jobs.filter((j) => !status || j.status === status)
       .slice(-100)
-      .map(({ payload: _payload, ...rest }) => rest);
+      // Never return the payload (issue body, options); the title is already public on GitHub
+      .map(({ payload, ...rest }) => ({
+        ...rest,
+        title: (payload as { event?: { issue?: { title?: string } } })?.event?.issue?.title,
+      }));
     res.json({ jobs, queueDepth: queueStore.getJobCountByStatus().queued });
   });
 

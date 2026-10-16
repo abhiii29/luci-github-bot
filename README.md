@@ -194,11 +194,20 @@ Unparseable output gets one repair attempt.
 
 | Endpoint | Description |
 |---|---|
+| `GET /` or `/dashboard` | Dashboard: jobs, worker capacity, model stats, plans (refreshes every 5 s) |
 | `POST /webhook` | GitHub webhook receiver (`issues`, `issue_comment`, `ping`) |
 | `GET /health` | Status and worker capacity (public) |
 | `GET /api/stats` | Metrics snapshot |
 | `GET /api/activity?limit=N` | Recent activity |
+| `GET /api/overview` | Status, capacity, host load, job counts, model/container stats |
+| `GET /api/plans` | Stored plans with their files and status |
 | `GET /api/jobs?status=queued\|running\|succeeded\|failed\|cancelled\|no_op` | Jobs, without their payloads, plus `queueDepth` |
+
+### Dashboard
+
+Open `http://localhost:3000/` on the bot's machine. Through ngrok or any proxy, the page asks for
+`API_TOKEN`, which it keeps for that browser tab only. The page itself contains no data: everything is
+read from `/api/*` with the same authentication. Issue titles are shown, but issue bodies never are.
 
 ## Architecture
 
@@ -222,6 +231,7 @@ src/
 ├── resource-monitor.ts # macOS CPU/memory → capacity
 └── metrics.ts / logger.ts / redact.ts / config.ts / types.ts
 images/worker.sh        # container entrypoint (prints one RESULT: {...} line)
+public/dashboard.html   # dashboard (static page, reads /api/*)
 ```
 
 ## Development and Tests
