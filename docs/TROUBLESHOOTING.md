@@ -52,7 +52,10 @@ npm run podman:build
 
 ## Bot Stuck at Capacity / Issues Queued
 
-### Symptom: Incoming issues get labeled `queued` instead of processing
+### Symptom: Issues stay `bot:queued` for a long time
+
+Queued jobs start automatically when a slot frees up; nothing needs to be re-triggered. List them with
+`curl -H "Authorization: Bearer $API_TOKEN" "localhost:3000/api/jobs?status=queued"`.
 
 **Check capacity**
 ```bash
@@ -67,7 +70,7 @@ podman ps -a --filter "ancestor=luci-github-bot-worker"
 If many are `running` for a long time, a worker may be hung. Increase `WORKER_TIMEOUT_MS` or investigate the specific issue.
 
 **Fix: Adjust thresholds**
-Lower `MEMORY_PRESSURE_MAX` or `CPU_MAX` in `.env` to allow more concurrent workers.
+Raise `MEMORY_PRESSURE_MAX` / `CPU_MAX` (worker slots shrink above these) or `MAX_CONCURRENT_WORKERS`.
 
 ---
 

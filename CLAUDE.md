@@ -1,47 +1,34 @@
-# luci-github-bot — Agent Notes
+# luci-github-bot — agent notes
+
+Self-hosted bot: issue assigned to the bot user → durable queue → LLM → validation → container → PR.
+README.md is the source of truth for behaviour; keep it in sync when behaviour changes.
 
 ## Commands
 
 ```bash
-npm run build          # Build TypeScript
-npm run dev            # Development (tsx, hot-reload)
-npm test               # Run vitest
-npm test:watch         # Watch mode
-npx tsc --noEmit       # Type check
-npm run podman:build   # Build worker container image
-npm run docker:build   # Alternative with Docker
-npm run build:all      # Build everything
+npm run build                  # tsc (type-check + compile)
+npm test                       # vitest: unit + tests/integration (no network/containers)
+scripts/smoke/run.sh           # real bot process, fake token, mock LLM, DRY_RUN (never reads .env)
+scripts/smoke/run.sh --worker  # + real container against git daemon and a stub GitHub API
 ```
 
-## Architecture (one-liners)
+`vitest` does not type-check: always run `npm run build` (or `npx tsc --noEmit`) too.
 
-- `index.ts` — Express server, ngrok tunnel, startup validation, graceful shutdown
-- `webhook.ts` — `/webhook` POST (HMAC verify, rate limit, body size limit, per-IP throttling)
-- `issue-handler.ts` — Trigger filtering, LLM dispatch, container lifecycle, PR creation
-- `llm.ts` — Remote single-shot (Adesso) + local 2-phase decomposition (Ollama), retry on 500/timeout
-- `docker-worker.ts` — Ephemeral container spawn (podman/docker), dynamic concurrency semaphore
-- `resource-monitor.ts` — macOS CPU/memory polling → worker slot scaling
-- `metrics.ts` — In-memory stats: issues processed, LLM generations, worker executions
-- `config.ts` — Zod schema, env parsing, startup validation
-- `directives.ts` — `/luci` block parser, `@local-model` alias, JobOptions construction
-- `repo-config.ts` — `.luci-bot.yml` loader from GitHub contents API (5-min cache)
-- `redact.ts` — Secret masking: GitHub PATs, bearer tokens, URL creds, configured secrets
-- `logger.ts` — JSON-lines structured logger with auto-redaction and `LOG_LEVEL`
+## Where things live
 
-## Conventions
-
-- TypeScript ESM, no `.js` extensions in imports
-- All error messages are redacted via `redact()` before logging
-- Never log secrets (tokens, keys, passwords, bearer tokens)
-- Zod for config validation; fail fast on missing/invalid env vars
-- All LLM output goes through the parser/validator before reaching the worker
-- Tests: vitest, one test file per source module, mock Ollama via fetch interceptor
+- Request path: `webhook.ts` → `dispatch.ts` (enqueue) → `queue.ts`/`store.ts` → `issue-handler.ts`
+- `/luci` commands: `command-handler.ts` (hooks) + `commands.ts` (parsing, collaborator gate)
+- Effective per-job options: `job-context.ts` (network) + `job-options.ts` (pure merge + globs)
+- What may leave the bot: `solution-validator.ts` + `secret-scan.ts`; worker.sh re-checks paths
+- Container: `docker-worker.ts` + `images/worker.sh` (prints one `RESULT: {...}` line)
 
 ## Rules
 
-- Never log or print secret values
-- All LLM output is validated (cycle detection, ID uniqueness, path normalization) before execution
-- Subtask concurrency defaults to 2 (Ollama bottleneck)
-- Webhook body size capped at 1 MB; missing event header → reject immediately
-- `/api/*` requires Bearer token; without it, routes are localhost-only
-- `PR partial_ok` policy: when enabled, return successful subtasks with warnings; otherwise fail the job but report which subtasks failed
+- ESM: relative imports end in `.js`.
+- Never log or post secrets; route error text through `redact()` (`github.ts` for comments).
+- All model output is untrusted: it goes through `validateSolution` + `validateSolutionContent`
+  and the scope check before any container runs. Never interpolate model text into shell code.
+- New work for an issue always goes through `enqueueIssue()` (one open job per issue).
+- Handler outcomes: `retryable: false` for refusals, clarification requests and validation errors.
+- Status on GitHub = one marker comment (edited in place) + one `bot:*` label; never touch other labels.
+- Every behaviour change needs a test; flows that cross modules go in `tests/integration/flow.test.ts`.

@@ -517,8 +517,9 @@ export async function generateSolutionWithDecomposition(
 
   // Validate decomposition structure
   const config = getConfig();
-  const MAX_SUBTASKS = 12;
-  const MAX_FILES_PER_SUBTASK = 20;
+  // Matches what the decomposition prompt asks for (2-5 subtasks, 2-3 files each), with a little slack
+  const MAX_SUBTASKS = 6;
+  const MAX_FILES_PER_SUBTASK = 3;
   const validation = validateDecomposition(
     decomposition.subtasks,
     MAX_SUBTASKS,

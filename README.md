@@ -1,278 +1,242 @@
 # luci-github-bot
 
-A self-hosted GitHub bot that turns assigned issues into pull requests — automatically.
+A self-hosted GitHub bot that turns assigned issues into pull requests.
 
-It receives issue webhooks, uses an LLM to generate code changes, executes them in isolated containers, and opens a PR. Supports both cloud-hosted (35B+) and local (7B) models, with task decomposition for smaller models.
+Assign an issue to the bot user and it queues the work, asks an LLM for a change, validates it, applies
+it in an isolated container, and opens a PR. It supports a cloud model (35B+, single-shot) and a local
+Ollama model (7B–8B, with task decomposition).
 
 ## Quick Start
 
 ```bash
-cp .env.example .env
-# edit .env with your tokens
+cp .env.example .env      # fill in GITHUB_TOKEN, WEBHOOK_SECRET, MONITORED_REPOS, ...
 npm install
-npm run dev          # development (tsx, hot-reload)
+npm run dev               # development (tsx)
 # or
-npm run build && npm start   # production
+npm run build && npm start
 ```
 
-The startup script (`bin/start-bot.sh`) also manages the podman machine lifecycle.
+`bin/start-bot.sh` also starts the podman machine if needed. On startup the bot builds the worker
+image, opens an ngrok tunnel (if `NGROK_AUTHTOKEN` is set), and registers the webhook on each monitored
+repo for the `issues` and `issue_comment` events.
 
-## What It Does
-
-1. **Listens** for `issues.assigned` webhooks on configured repos
-2. **Generates** code changes via LLM (cloud or local)
-3. **Executes** changes in isolated containers (podman/docker)
-4. **Creates** a branch, commits, pushes, and opens a PR
+## How It Works
 
 ```
-[GitHub Webhook] ──assigned──► [luci-github-bot]
-                                      │
-                          ┌───────────┴───────────┐
-                          ▼                       ▼
-                     [LLM]                 [Docker/Podman]
-                generate solution      spawn worker container
-                          │                       │
-                          ▼                       ▼
-                   [Code Generation]  [clone → modify → commit → push → PR]
-                                      │
-                                      ▼
-                              [PR on GitHub]
+issue assigned to bot ──► webhook (HMAC, dedupe) ──► durable job queue ──► handler
+                                                                             │
+       repo context (relevant files) ◄───────────────────────────────────────┤
+       LLM: plan or solution (remote single-shot / local decomposition) ◄────┤
+       validation: paths, secrets, scope, limits ◄───────────────────────────┤
+       container: clone → apply → commit → push → PR (Closes #N) ◄───────────┘
+                                                                             │
+                     one status comment + one bot:* label on the issue ◄─────┘
 ```
 
-## Trigger Rules
+- **Queue:** jobs are persisted in `.luci-queue.json`, so they survive restarts. There is at most one
+  open job per issue, and concurrency is capped by `MAX_CONCURRENT_WORKERS` and host load. A job
+  interrupted by a restart is re-queued.
+- **Retries:** failures that may be transient (an unusable model answer, a container error) are
+  retried once automatically. Refusals, clarification requests and validation failures are not retried.
+- **Feedback on the issue:** the bot keeps a single status comment and edits it in place. It also sets
+  exactly one status label: `bot:queued`, `bot:in-progress`, `bot:awaiting-review` or `bot:blocked`.
+  Your own labels are never touched.
 
-The bot responds to the **`issues.assigned`** webhook event only. It processes an event when:
+## Triggering the Bot
 
-- The assignee matches the bot user (auto-detected from the first monitored repo's owner, or via `GITHUB_BOT_USERNAME`)
+| Action | Effect |
+|---|---|
+| Assign the issue to the bot user | Queue a job |
+| Add the `needs-retry` label | Queue a new attempt |
+| Comment `/luci <command>` | See [Commands](#commands) |
 
-It ignores events when:
+The bot ignores closed issues, pull requests, issues labelled `bot:no-run`, events sent by the bot
+itself, and assignments of other users. The bot user is `GITHUB_BOT_USERNAME`, or the owner of the
+first monitored repo if that is unset. Logins are matched case-insensitively.
 
-- The event `sender` is the bot user itself (prevents loops)
-- The issue is closed
-- The issue is actually a PR (`issue.pull_request` is set)
-- The issue has the `bot:no-run` label
+### Commands
 
-If you label an issue `needs-retry`, the bot will reprocess it.
+Commands are comments that start with `/luci`. Only repo collaborators can use them, and commands
+inside code blocks are ignored.
 
-### Per-Issue Directives
+| Command | Effect |
+|---|---|
+| `/luci retry` | Queue a new attempt |
+| `/luci plan` | Ask for a plan only (files, approach, risks, questions); no code is written |
+| `/luci go` | Implement the pending plan, restricted to exactly the files it lists |
+| `/luci cancel` | Drop a queued job or pending plan; a running job stops before pushing |
+| `/luci status` | Show the latest job and plan state |
+| `/luci explain` | Show the settings the bot would use, without calling a model |
 
-You can add a `/luci` block anywhere in the issue body (or `@local-model` at the start of the title) to control execution:
+A plan becomes invalid if the issue body is edited, and expires after 7 days. A plan can be
+executed only once.
+
+### Per-Issue Settings
+
+**Labels** (they can only switch behaviour on):
+
+| Label | Effect |
+|---|---|
+| `bot:local` | Use the local Ollama model |
+| `bot:plan-only` | Post a plan and wait for `/luci go` |
+| `bot:dry-run` | Generate and validate, but push nothing |
+| `bot:no-pr` | Push the branch but don't open a PR |
+| `bot:no-run` | Never process this issue |
+
+**Directives**: a `/luci` line in the issue body, or `@local-model` at the start of the title:
 
 ```
-/luci model=local base=develop plan-only dry-run
+/luci model=local base=develop files=src/api/** plan-only dry-run no-pr
 ```
 
-| Key | Values | Description |
-|---|---|---|
-| `model` | `local` or `remote` | Which LLM pipeline to use |
-| `base` | `<branch>` | Base branch for the PR |
-| `files` | `glob,glob` | Hint/limit to specific files |
-| `plan-only` | (flag) | Generate plan but don't execute |
-| `dry-run` | (flag) | Print changes, don't push or open PR |
-| `no-pr` | (flag) | Commit but don't open PR |
+| Key | Meaning |
+|---|---|
+| `model=local\|remote` | Which pipeline to use |
+| `base=<branch>` | Base branch for the PR (default: the repo's default branch) |
+| `files=<glob,...>` | Files to focus on (a hint for context selection) |
+| `plan-only`, `dry-run`, `no-pr` | Same as the labels |
 
-Unknown keys generate warnings but are not fatal. Directives can only narrow what the bot does — they cannot lift per-repo deny rules.
+Directives are honoured only when the issue author is a collaborator. Otherwise they are ignored and
+a warning appears in the status comment.
 
-Directives are only honoured when the issue author or assigner is a repo collaborator or owner (checked via the GitHub API).
+**Per-repo `.luci-bot.yml`** (cached for 5 minutes):
 
-### Per-Repo Configuration
+```yaml
+model: remote            # default pipeline
+baseBranch: main         # default PR base
+allowedPaths: [src/**, docs/**]   # every changed file must match
+deniedPaths: [infra/**]           # added to the built-in deny list
+maxFiles: 10             # can lower, never raise, the limit of 20
+```
 
-Place a `.luci-bot.yml` file in the repo's root. Loaded once and cached for 5 minutes:
+Precedence is `.luci-bot.yml` limits > labels > directives > defaults. Nothing written in an issue
+can widen the repo's path rules or limits.
 
-| Key | Type | Description |
-|---|---|---|
-| `model` | `string` | Override default model |
-| `baseBranch` | `string` | Override default base branch |
-| `allowedPaths` | `string[]` | Glob patterns of allowed files |
-| `deniedPaths` | `string[]` | Glob patterns of denied files |
-| `maxFiles` | `number` | Max files per subtask |
-| `labels` | `string[]` | Labels to attach |
-| `reviewers` | `string[]` | PR reviewers |
+## Safety
 
-An invalid `.luci-bot.yml` is ignored with a warning; defaults apply.
+- **Untrusted input:** issue text and repository files are placed inside randomly delimited data
+  blocks, and the system prompt tells the model never to follow instructions found there. The model
+  can answer `REFUSE:` or `NEEDS_CLARIFICATION:`, and the bot reports either on the issue without
+  retrying.
+- **Validation before anything runs:**
+  - Branch name and commit message are checked.
+  - Paths may not contain traversal, absolute paths or `.git/`.
+  - Denied paths cannot be changed: `.github/workflows/**`, `.env*`, SSH keys, plus repo
+    `deniedPaths`.
+  - At most 20 files and 1 MB per change.
+  - Secrets (tokens, keys, private keys) are scanned for and blocked.
+  - Suspicious additions such as `curl | sh` or new `postinstall` scripts are blocked unless the
+    issue asks for them.
+  - Deleting more than 5 files, or deleting protected files, is blocked.
+  - Files outside `allowedPaths` or the approved plan are rejected.
+- **The worker container:**
+  - Runs as uid 1000 on a read-only root filesystem.
+  - Has `--cap-drop=ALL` and `no-new-privileges`, with tmpfs scratch space.
+  - Supports optional memory, CPU and pids limits.
+  - Gets the token through its environment, never in argv, URLs or on disk.
+  - Treats every value from the model as data: nothing is interpolated into shell commands.
+  - Never force-pushes. A retry gets a new branch name.
+- **The webhook:**
+  - Verifies the HMAC-SHA256 signature.
+  - Processes each delivery ID once.
+  - Limits body size and rate-limits per IP.
+- **`/api/*`:** requires `Authorization: Bearer $API_TOKEN`. Without `API_TOKEN` it only answers
+  direct requests from this machine, never requests through ngrok or another proxy.
+- **Redaction:** secrets are removed from logs and from every comment the bot posts.
 
 ## LLM Modes
 
-| Mode | Trigger | Model | Strategy |
-|---|---|---|---|
-| Remote | Default | 35B+ (cloud) | Single-shot prompt |
-| Local | `@local-model` prefix or `model=local` | 7B-8B (Ollama) | 2-phase decomposition |
+| Mode | When | Strategy |
+|---|---|---|
+| Remote (default) | — | One request with the issue plus the most relevant repo files |
+| Local | `bot:local`, `model=local`, `@local-model`, or `.luci-bot.yml` | Decompose into up to 6 subtasks (max 3 files each), then execute them |
 
-### Local Model Pipeline (2-Phase)
-
-When the `@local-model` prefix is used, the bot switches to the local Ollama instance:
-
-**Phase 1 — Decomposition:** The 7B model breaks the issue into independent subtasks (JSON), each specifying target files and dependencies. The output is validated for cycle-free dependencies, duplicate IDs, and size limits.
-
-**Phase 2 — Execution:** Subtasks run in parallel (up to 2 concurrent by default, since Ollama is the bottleneck), each getting current file content for context. Failed subtasks get a retry with a repair prompt.
-
-**Conflict resolution:** Last-writer-wins for same-file edits. Partial failures produce error reports rather than total aborts.
-
-This "divide and conquer" approach improves reliability on smaller models.
+In local mode, subtasks without dependencies on each other run two at a time. Subtasks that edit the
+same file run one after the other, and the later one sees the earlier one's output. Decompositions
+are rejected if they contain cycles, unknown dependencies or duplicate IDs, or exceed the size limits.
+Unparseable output gets one repair attempt.
 
 ## Configuration
 
 | Env Variable | Description | Default |
 |---|---|---|
-| `GITHUB_TOKEN` | PAT with `repo` scope | — |
-| `ADASSO_BASE_URL` | LLM API base URL | `https://adesso-ai-hub.3asabc.de/v1` |
-| `ADASSO_API_KEY_FILE` | Path to API key file | `~/.config/opencode/adesso.key` |
-| `ADASSO_MODEL` | Remote model name | `qwen-3.6-35b-sovereign` |
-| `NGROK_AUTHTOKEN` | ngrok auth token (for public URL) | — |
-| `LISTEN_PORT` | HTTP listen port | `3000` |
-| `WEBHOOK_SECRET` | HMAC secret for signature verification (min 16 chars) | — |
+| `GITHUB_TOKEN` | PAT with `repo` scope (and `admin:repo_hook` for auto-registration) | — |
+| `WEBHOOK_SECRET` | HMAC secret, min. 16 characters | — |
 | `MONITORED_REPOS` | Comma-separated `owner/repo` list | `luci/luci-bot` |
-| `CONTAINER_RUNTIME` | `podman` or `docker` | `podman` |
+| `GITHUB_BOT_USERNAME` | Bot login | owner of the first repo |
+| `ADASSO_BASE_URL` | OpenAI-compatible LLM endpoint | `https://adesso-ai-hub.3asabc.de/v1` |
+| `ADASSO_API_KEY_FILE` | File containing the LLM API key | `~/.config/opencode/adesso.key` |
+| `ADASSO_MODEL` | Remote model | `qwen-3.6-35b-sovereign` |
 | `OLLAMA_BASE_URL` | Local Ollama endpoint | `http://localhost:11434` |
-| `OLLAMA_MODEL` | Local model name | `qwen3:8b` |
-| `OLLAMA_DECOMPOSITION_TIMEOUT_MS` | Phase 1 timeout | `300000` (5 min) |
-| `OLLAMA_SUBTASK_TIMEOUT_MS` | Phase 2 per-subtask timeout | `300000` (5 min) |
-| `MAX_CONCURRENT_WORKERS` | Max simultaneous containers | `1` |
-| `WORKER_TIMEOUT_MS` | Per-issue container timeout | `600000` (10 min) |
-| `MEMORY_PRESSURE_MAX` | Memory threshold for scaling | `85` |
-| `CPU_MAX` | CPU threshold for scaling | `90` |
-| `RESOURCE_CHECK_INTERVAL_MS` | Resource polling interval | `10000` |
-| `GIT_AUTHOR_NAME` | Git author name for PRs | `luci-github-bot` |
-| `GIT_AUTHOR_EMAIL` | Git author email for PRs | `luci-github-bot@users.noreply.github.com` |
-| `GITHUB_BOT_USERNAME` | Override auto-detected bot username | — |
-| `API_TOKEN` | Bearer token for `/api/*` endpoints | — |
-| `WEBHOOK_BODY_LIMIT` | Max webhook body size in bytes | `1048576` (1 MB) |
-| `RATE_LIMIT_WINDOW_MS` | Per-IP rate limit window | `60000` (60s) |
-| `RATE_LIMIT_MAX_REQUESTS` | Max requests per window | `100` |
-| `SHUTDOWN_TIMEOUT_MS` | Graceful shutdown wait time | `30000` (30s) |
-| `LOG_LEVEL` | Logger level (debug/info/warn/error) | `info` |
-| `DRY_RUN` | Skip push/PR, print solution summary | `false` |
-
-The bot user is auto-detected from the first monitored repo's owner, or overridden via `GITHUB_BOT_USERNAME`.
+| `OLLAMA_MODEL` | Local model | `qwen3:8b` |
+| `OLLAMA_DECOMPOSITION_TIMEOUT_MS` | Decomposition timeout | `300000` |
+| `OLLAMA_SUBTASK_TIMEOUT_MS` | Per-subtask timeout | `300000` |
+| `NGROK_AUTHTOKEN` | Start an ngrok tunnel and register webhooks | — |
+| `LISTEN_PORT` | HTTP port | `3000` |
+| `API_TOKEN` | Bearer token for `/api/*` | — (local only) |
+| `CONTAINER_RUNTIME` | `podman` or `docker` | `podman` |
+| `MAX_CONCURRENT_WORKERS` | Max simultaneous jobs/containers (1–10) | `1` |
+| `WORKER_TIMEOUT_MS` | Container timeout per job | `600000` |
+| `CONTAINER_MEMORY` / `CONTAINER_CPUS` / `CONTAINER_PIDS_LIMIT` | Container limits, e.g. `1g` / `1.5` / `256` | — |
+| `MEMORY_PRESSURE_MAX` / `CPU_MAX` | Host load (%) above which worker slots shrink | `85` / `90` |
+| `RESOURCE_CHECK_INTERVAL_MS` | Host load polling interval | `10000` |
+| `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | Commit author | `luci-github-bot` / `…@users.noreply.github.com` |
+| `DRY_RUN` | `1`: never push, just report (global) | `false` |
+| `PLAN_DATA_DIR` | Where pending plans are stored | `.luci-bot-plans` |
+| `WEBHOOK_BODY_LIMIT` | Max webhook body (bytes) | `1048576` |
+| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX_REQUESTS` | Per-IP rate limit | `60000` / `100` |
+| `SHUTDOWN_TIMEOUT_MS` | Max wait for running jobs on shutdown | `30000` |
+| `LOG_LEVEL` | `debug` / `info` / `warn` / `error` | `info` |
+| `GIT_BASE_URL` / `GITHUB_API_URL` | Git/API base used by the worker container (GitHub Enterprise, tests) | github.com |
 
 ## Endpoints
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/webhook` | POST | GitHub webhook receiver (HMAC verified) |
-| `/health` | GET | Health + resource capacity (public) |
-| `/api/*` | various | API endpoints (requires `API_TOKEN` bearer auth) |
-| `/api/stats` | GET | Full metrics snapshot |
-| `/api/activity` | GET | Recent activity log (`?limit=N`) |
-
-### Health Response
-
-```json
-{
-  "status": "ok",
-  "timestamp": "2026-10-15T22:37:18.233Z",
-  "capacity": { "available": 1, "max": 1, "full": false }
-}
-```
-
-### Stats Response
-
-```json
-{
-  "totalIssuesProcessed": 5,
-  "issuesByStatus": { "success": 4, "failed": 1, "queued": 0, "blocked": 0 },
-  "llmGenerations": {
-    "total": 5, "success": 5, "failed": 0,
-    "localModelUsed": 2, "remoteModelUsed": 3
-  },
-  "workerExecutions": { "total": 5, "success": 4, "failed": 1 },
-  "recentActivity": [...],
-  "uptimeSeconds": 3600,
-  "startTime": "2026-10-15T21:37:18.233Z"
-}
-```
+| Endpoint | Description |
+|---|---|
+| `POST /webhook` | GitHub webhook receiver (`issues`, `issue_comment`, `ping`) |
+| `GET /health` | Status and worker capacity (public) |
+| `GET /api/stats` | Metrics snapshot |
+| `GET /api/activity?limit=N` | Recent activity |
+| `GET /api/jobs?status=queued\|running\|succeeded\|failed\|cancelled\|no_op` | Jobs, without their payloads, plus `queueDepth` |
 
 ## Architecture
 
 ```
 src/
-├── index.ts          # Entry point, ngrok tunnel, server startup, shutdown
-├── webhook.ts        # Express app, webhook receiver, HMAC, rate limit, auth
-├── issue-handler.ts  # Issue routing, LLM dispatch, container lifecycle
-├── llm.ts            # LLM integration (remote single-shot + local decomposition)
-├── docker-worker.ts  # Container runtime (Podman/Docker), dynamic semaphore
-├── resource-monitor.ts # macOS CPU/memory polling → capacity signal
-├── metrics.ts        # In-memory metrics collector
-├── config.ts         # Schema (Zod) + env parsing
-├── types.ts          # Shared type definitions
-├── directives.ts     # /luci directive parser, JobOptions, JobOptions validation
-├── repo-config.ts    # .luci-bot.yml loader from GitHub API
-├── redact.ts         # Secret masking for logs
-└── logger.ts         # JSON-lines structured logger
-
-images/
-└── worker.sh         # Container entrypoint: clone → apply → commit → push → PR
-
-bin/
-└── start-bot.sh      # Podman lifecycle manager + bot launcher
+├── index.ts            # startup validation, worker + queue wiring, ngrok, webhook registration, shutdown
+├── webhook.ts          # Express app: HMAC, dedupe, routing, /health, /api/*
+├── dispatch.ts         # the one way to enqueue/cancel work for an issue
+├── queue.ts / store.ts # durable job queue (JSON file), retries, restart recovery
+├── issue-handler.ts    # one job: context → plan or solution → validation → container → GitHub status
+├── command-handler.ts  # /luci commands → dispatch / plan flow
+├── commands.ts         # command parsing + collaborator gate
+├── plan.ts             # plan-only flow: storage, approval, expiry, invalidation
+├── job-options.ts / job-context.ts  # directives + labels + .luci-bot.yml → effective options
+├── directives.ts / label-switches.ts / repo-config.ts / collaborators.ts
+├── llm.ts / prompts.ts # model calls, hardened prompts, output parsing
+├── repo-context.ts     # pick and fetch the most relevant files within a budget
+├── solution-validator.ts / secret-scan.ts  # what may leave the bot
+├── docker-worker.ts    # container runtime, capacity-aware semaphore
+├── github.ts           # GitHub REST client, status comment/labels
+├── resource-monitor.ts # macOS CPU/memory → capacity
+└── metrics.ts / logger.ts / redact.ts / config.ts / types.ts
+images/worker.sh        # container entrypoint (prints one RESULT: {...} line)
 ```
 
-### Worker Container
-
-Each issue spawns an ephemeral container running `worker.sh`:
-
-1. Authenticates with GitHub (via token in URL for clone/push)
-2. Clones the target repo
-3. Applies code changes (writes files, handles create/update/delete)
-4. Commits and pushes to a new branch
-5. Opens a PR via the GitHub API
-
-The container is killed and removed after completion.
-
-### Dynamic Concurrency
-
-A macOS resource monitor polls `top` and `vm_stat` every 10 seconds. CPU/memory pressure scales available worker slots 0–10. When full, incoming issues are queued (labeled `queued`) and processed as slots free up.
-
-### Security
-
-- Webhook payloads are verified via HMAC-SHA256
-- All secrets in logs are automatically redacted (GitHub tokens, bearer tokens, URL creds)
-- `/api/*` endpoints require a Bearer token (`API_TOKEN` env var); without it, routes bind to localhost only
-- Webhook body size is limited (default 1 MB)
-- Per-IP rate limiting is applied to all endpoints
-
-### Error Handling
-
-- LLM failures → issue labeled `blocked`, comment with error details
-- Worker failures (clone, push, PR creation) → issue labeled `blocked`
-- Retries → label the issue `needs-retry` and comment to reprocess
-- Invalid decomposition (cycles, duplicates, unknown deps) → fails fast with a descriptive error
-
-## Development
+## Development and Tests
 
 ```bash
-# Build TypeScript
-npm run build
-
-# Development with hot-reload
-npm run dev
-
-# Build worker image
-npm run podman:build    # or npm run docker:build
-
-# Full pipeline
-npm run build:all
-
-# Run tests
-npm test
-
-# Run smoke tests (with mock LLM, no podman/Ollama required)
-cd scripts/smoke
-./run.sh
+npm run build                 # type-check + compile
+npm test                      # unit + integration tests (no network, no containers)
+npm run test:regression       # regression subset
+scripts/smoke/run.sh          # boot the real bot (fake token, mock LLM, DRY_RUN) and drive it over HTTP
+scripts/smoke/run.sh --worker # also run the container path against git daemon + a stub GitHub API
+npm run podman:build          # build the worker image by hand (startup does this too)
 ```
 
-## Smoke Tests
-
-A repeatable end-to-end smoke test suite is provided in `scripts/smoke/`. It:
-
-- Starts a mock LLM server (`mock-llm.mjs`) that returns fixed responses
-- Starts the bot with `DRY_RUN=1` (no push/PR)
-- Sends 7 webhook fixtures covering: assigned-to-bot, assigned-to-other, wrong-repo, bad-signature, needs-retry, injection payload, and duplicate delivery
-- Asserts HTTP outcomes against `/api/stats`
-- Prints a pass/fail table
-
-See `docs/SMOKE.md` for full instructions.
-```
+The smoke and worker tests never read your `.env`. They need podman, or set `CONTAINER_RUNTIME=docker`.
+See `docs/SMOKE.md` for running against a real throwaway repo, and `docs/TROUBLESHOOTING.md` when
+something goes wrong.
 
 ## License
 

@@ -1,118 +1,70 @@
-# Smoke Test Guide
+# Smoke and end-to-end tests
 
-## Quick Start
-
-```bash
-# From the project root
-cd scripts/smoke
-chmod +x run.sh send-webhook.sh
-./run.sh
-```
-
-The smoke test starts a mock LLM server and the bot with `DRY_RUN=1`, sends
-six webhook fixtures, asserts HTTP outcomes, and prints a pass/fail table.
-
-## What It Tests
-
-| Fixture | Scenario | Expected |
-|---|---|---|
-| `assigned-to-bot` | Bot is assignee, `@local-model` in title | Accepted (200) |
-| `assigned-to-other` | Assigned to different user | Ignored (200) |
-| `wrong-repo` | Not in `MONITORED_REPOS` | Ignored (200) |
-| `needs-retry` | Has `needs-retry` label | Triggers retry logic |
-| `injection-payload` | Command injection in title/body | Accepted, sanitized |
-| `duplicate-delivery` | Duplicate delivery ID | Should not double-process |
-
-## Prerequisites
-
-- Node.js installed
-- `.env` file present (copied from `.env.example` and filled in)
-- No podman/Ollama required (mock LLM handles LLM traffic)
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `BOT_URL` | `http://localhost:3000` | Bot API URL |
-| `MOCK_LLM_PORT` | `19999` | Mock LLM server port |
-| `WEBHOOK_SECRET` | (from `.env`) | HMAC secret for signing payloads |
-
-## Manual Testing Against a Real Repo
-
-### Setup
-
-1. Create a throwaway repo:
-   ```bash
-   gh repo create test-luci-bot --public
-   ```
-
-2. Ensure your PAT has `repo` scope and set `GITHUB_TOKEN` in `.env`.
-
-3. Add the repo to `MONITORED_REPOS` in `.env`:
-   ```
-   MONITORED_REPOS=testuser/test-luci-bot
-   ```
-
-4. Build and start the bot:
-   ```bash
-   npm run build:all
-   npm start
-   ```
-
-5. In a separate terminal, register a GitHub webhook:
-   ```bash
-   # The bot auto-registers on startup when ngrok is configured
-   # Or manually via:
-   gh api repos/testuser/test-luci-bot/hooks -f active=true -f config[url]="https://your-ngrok-url/webhook" -f config[content_type]="json" -f config[secret]="your-webhook-secret"
-   ```
-
-### Running a Test
-
-1. Assign an issue to the bot user:
-   ```bash
-   gh issue create --repo testuser/test-luci-bot \
-     --title "@local-model Add a health check endpoint" \
-     --body "Please add a health check endpoint that returns JSON with status and timestamp."
-   ```
-
-2. The bot should:
-   - Receive the webhook
-   - Call the LLM (remote or local depending on `@local-model`)
-   - Generate a solution
-   - Execute it in a container
-   - Open a PR with the changes
-
-### Expected Outcome
-
-- A new branch `luci/test-luci-bot/<issue-number>-<short-hash>` is created
-- A PR is opened against the target branch
-- The bot comments on the issue with a summary
-
-### Cleanup
+## Local, safe (no GitHub account, no real tokens)
 
 ```bash
-# Delete the test repo
-gh repo delete testuser/test-luci-bot --yes
-
-# Remove the webhook
-gh api repos/testuser/test-luci-bot/hooks -X DELETE -f hook_id=<hook-id>
+scripts/smoke/run.sh            # bot process
+scripts/smoke/run.sh --worker   # bot process + container path
 ```
 
-## Adding New Fixtures
+**`scripts/smoke/smoke.ts`** boots the real `src/index.ts` in an empty temp directory, so your `.env`
+is never loaded. It runs with a fake GitHub token, a mock LLM (`mock-llm.mjs`) and `DRY_RUN=1`. It checks:
 
-1. Create a new JSON file in `scripts/smoke/fixtures/`
-2. Follow the schema of existing fixtures (see `assigned-to-bot.json`)
-3. Add a test case in `scripts/smoke/run.sh`
+- startup, including the worker image build
+- `/health`
+- `ping`
+- that a bad signature is rejected
+- that unmonitored repos and other assignees are ignored
+- `/api` authentication
+- that an assignment is queued, and a redelivery is deduplicated
+- that the job finishes as `no_op` (dry run)
+- that `/api/jobs` hides payloads
+- a clean `SIGTERM`
+- that the queue is persisted
+- that no secret appears in the logs
 
-## Troubleshooting
+GitHub API calls are attempted with the fake token and fail with 401, which the bot must tolerate.
 
-See `docs/TROUBLESHOOTING.md` for common issues.
+**`scripts/e2e/worker-e2e.ts`** runs `DockerWorker.processIssue` with a real container against a
+throwaway bare repo served by `git daemon`, plus a stub of the "create pull request" API. It covers:
 
-If the mock LLM server fails to start, check:
-- Port 19999 is not in use
-- Node.js is available and supports ES modules
+- a PR is created against the detected default branch, with `Closes #N`
+- hostile commit messages are stored literally and never executed
+- a no-op solution reports `no_changes`
+- a retry gets a unique branch name
+- `noPr` pushes the branch without opening a PR
+- path traversal is rejected
+- a missing base branch produces an error
+- the token never leaks
 
-If the bot fails to start:
-- Check that `.env` has valid values
-- Ensure the API key file exists and is readable
-- Check `npm run dev` output for errors
+Both need podman (or `CONTAINER_RUNTIME=docker`). The first run builds the worker image.
+
+`send-webhook.sh` signs and posts a single fixture to a running bot:
+
+```bash
+WEBHOOK_SECRET=... scripts/smoke/send-webhook.sh scripts/smoke/fixtures/assigned-to-bot.json issues
+```
+
+## Against a real throwaway repo
+
+1. Create a repo and a bot account, or use your own account as the bot with `GITHUB_BOT_USERNAME`:
+   ```bash
+   gh repo create you/luci-sandbox --private --add-readme
+   ```
+2. In `.env`, set:
+   - `MONITORED_REPOS=you/luci-sandbox`
+   - `GITHUB_TOKEN` (scope `repo`, plus `admin:repo_hook` for auto-registration)
+   - `WEBHOOK_SECRET`
+   - `NGROK_AUTHTOKEN` (or expose the port yourself)
+3. Start with `DRY_RUN=1 npm run dev` first. The bot registers the webhook for `issues` and
+   `issue_comment`.
+4. Create an issue and assign it to the bot user. Expect one status comment, a `bot:*` label and a
+   "Dry run" summary comment.
+5. Try `/luci explain`, then `/luci plan` and `/luci go`, as comments.
+6. Restart without `DRY_RUN`, then comment `/luci retry`. Expect a PR with `Closes #N`.
+
+**Cleanup:**
+
+```bash
+gh repo delete you/luci-sandbox --yes
+```
