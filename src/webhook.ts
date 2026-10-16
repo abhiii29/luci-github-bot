@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import express, { Request, Response, NextFunction } from "express";
+import pkg from "../package.json" with { type: "json" };
 import { getConfig } from "./config.js";
 import { DockerWorker } from "./docker-worker.js";
 import { ResourceStats } from "./resource-monitor.js";
@@ -198,6 +199,11 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
   const app = express();
   const realConfig = getConfig();
 
+  // Public version endpoint
+  app.get("/version", (_req: Request, res: Response) => {
+    res.json({ name: pkg.name, version: pkg.version });
+  });
+
   app.use(express.json({
     limit: appConfig.webhookBodyLimit,
     verify: (req: Request, _res: Response, buf) => {
@@ -241,179 +247,4 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
          return res.status(401).json({ error: "Invalid signature" });
        }
 
-      const eventType = req.headers["x-github-event"] as string;
-      const deliveryId = req.headers["x-github-delivery"] as string;
-
-      // Reject missing X-GitHub-Event header
-      if (!eventType) {
-        logger.warn("[webhook] Missing X-GitHub-Event header");
-        return res.status(400).json({ error: "Missing X-GitHub-Event header" });
-      }
-
-      if (eventType === "ping") {
-        return res.status(200).json({ status: "pong" });
-      }
-
-      if (eventType !== "issues" && eventType !== "issue_comment") {
-        logger.info("[webhook] Ignoring event type: " + eventType);
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      const body = req.body as unknown;
-      if (!isGitHubIssueEvent(body)) {
-        logger.error("[webhook] Invalid issue event payload");
-        return res.status(400).json({ error: "Invalid payload" });
-      }
-
-      if (!appConfig.monitoredRepos.includes(body.repository.full_name)) {
-        logger.info(
-          `[webhook] Ignoring issue #${body.issue.number} from unmonitored repo: ${body.repository.full_name}`
-        );
-        return res.status(200).json({ status: "ignored", repo: body.repository.full_name });
-      }
-
-      // GitHub redelivers on timeouts and manual "Redeliver": process each delivery once
-      if (queueStore && deliveryId && queueStore.deliveryReceived(deliveryId)) {
-        logger.info(`[webhook] Duplicate delivery ${deliveryId}, ignoring`);
-        return res.status(200).json({ status: "ignored", reason: "duplicate" });
-      }
-
-      const isBotLogin = (login: string | undefined) =>
-        !!login && !!appConfig.botUsername && login.toLowerCase() === appConfig.botUsername.toLowerCase();
-
-      // ── /luci comment commands ──
-      if (eventType === "issue_comment") {
-        const c = body as unknown as GitHubCommentEvent;
-        if (c.action !== "created" || !c.comment || c.issue.pull_request) {
-          return res.status(200).json({ status: "ignored" });
-        }
-        // Loop prevention is content-based: the bot's own comments never start with /luci and carry its
-        // marker. (A login check would break the common setup where the bot runs as your own account.)
-        const text = c.comment.body ?? "";
-        if (!/^\s*\/luci\b/im.test(text) || text.includes("<!-- luci-bot") || c.comment.user?.type === "Bot") {
-          return res.status(200).json({ status: "ignored" });
-        }
-        if (!commentHandler) return res.status(200).json({ status: "ignored", reason: "commands_disabled" });
-        commentHandler(c).catch((error) => {
-          logger.error(`[webhook] Comment handler error for #${c.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
-        });
-        return res.status(200).json({ status: "accepted" });
-      }
-
-      const event = body;
-
-      if (event.issue.state === "closed" || event.issue.pull_request) {
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      // ── Retry: `needs-retry` label added (or present when the issue is edited) ──
-      const retryLabelAdded = event.action === "labeled" && event.label?.name === "needs-retry";
-      const retryOnEdit = event.action === "edited" && event.issue.labels.some((l) => l.name === "needs-retry");
-      // The bot never adds `needs-retry` itself (it only removes it), so no sender check is needed.
-      if ((retryLabelAdded || retryOnEdit) && retryHandler) {
-        logger.info(`[webhook] Retry triggered for issue #${event.issue.number} in ${event.repository.full_name}`);
-        retryHandler(event).catch((error) => {
-          logger.error(
-            `[webhook] Retry handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
-          );
-        });
-        return res.status(200).json({ status: "retry", action: event.action });
-      }
-
-      // ── Issue body edited: invalidate a pending plan ──
-      if (event.action === "edited" && event.changes?.body && editHandler) {
-        editHandler(event).catch((error) => {
-          logger.error(`[webhook] Edit handler error for #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
-        });
-        return res.status(200).json({ status: "edited" });
-      }
-
-      if (event.action !== "assigned") {
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      // The payload's top-level `assignee` is the user just assigned (issue.assignee is only the first one)
-      const assignee = event.assignee?.login ?? event.issue.assignee?.login;
-      if (!isBotLogin(assignee)) {
-        logger.info(`[webhook] Ignoring assign #${event.issue.number} — assigned to ${assignee}`);
-        return res.status(200).json({ status: "ignored", assignee });
-      }
-      // Self-assignment is allowed: the bot never assigns issues, and it may run as your own account.
-      if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
-        logger.info(`[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`);
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      logger.info(
-        `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
-      );
-
-      try {
-        event.jobOptions = await computeJobOptions(event, appConfig.githubToken);
-      } catch (error) {
-        logger.warn(`[webhook] Could not resolve job options, using defaults: ${redact(error instanceof Error ? error.message : String(error))}`);
-      }
-
-      if (isDispatchReady()) {
-        if (openJobFor(event.repository.full_name, event.issue.number)) {
-          return res.status(200).json({ status: "ignored", reason: "already_queued" });
-        }
-        // Mark as queued first: enqueueing can start the job immediately, and its status updates
-        // must come after this one.
-        if (queuedHandler) queuedHandler(event).catch(() => {});
-        const r = enqueueIssue(event);
-        if (r.status === "already_queued") {
-          return res.status(200).json({ status: "ignored", reason: "already_queued" });
-        }
-        metrics.recordQueue();
-        return res.status(200).json({ status: "queued" });
-      }
-
-      // No queue configured (tests / minimal setups): run handlers directly
-      handlers.forEach(async (handler) => {
-        try {
-          await handler(event);
-        } catch (error) {
-          logger.error(
-            `[webhook] Handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
-          );
-        }
-      });
-      return res.status(200).json({ status: "accepted" });
-    })
-  );
-
-  // Health check endpoint (public, coarse info only)
-  app.get("/health", (_req: Request, res: Response) => {
-    const stats = getHealthStats();
-    res.json({ status: stats.status, timestamp: stats.timestamp, capacity: stats.capacity });
-  });
-
-  // Auth middleware for /api/* routes
-  app.use("/api", authMiddleware(realConfig));
-
-  // Stats endpoint
-  app.get("/api/stats", (_req: Request, res: Response) => {
-    res.json(metrics.getSnapshot());
-  });
-
-  // Jobs endpoint (no payloads: they contain issue text)
-  app.get("/api/jobs", (req: Request, res: Response) => {
-    if (!queueStore) return res.json({ jobs: [], queueDepth: 0 });
-    const status = typeof req.query.status === "string" ? req.query.status : undefined;
-    const jobs = queueStore
-      .getSnapshot()
-      .jobs.filter((j) => !status || j.status === status)
-      .slice(-100)
-      .map(({ payload: _payload, ...rest }) => rest);
-    res.json({ jobs, queueDepth: queueStore.getJobCountByStatus().queued });
-  });
-
-  // Recent activity endpoint
-  app.get("/api/activity", (req: Request, res: Response) => {
-    const limit = parseInt(req.query.limit as string) || 20;
-    res.json(metrics.getRecentActivity(Math.min(limit, 100)));
-  });
-
-  return app;
-}
+      const eventType = req.headers["x-github-event"] as st
