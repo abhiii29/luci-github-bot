@@ -10,6 +10,7 @@ import {
   TruncatedResponseError,
 } from "./llm.js";
 import { guardChanges } from "./change-guard.js";
+import { withUsage, currentUsage, formatUsage } from "./usage.js";
 import { DockerWorker, type WorkerProgress } from "./docker-worker.js";
 import { getConfig } from "./config.js";
 import { metrics } from "./metrics.js";
@@ -86,7 +87,12 @@ async function writeStatusComment(
   extra: { category?: string; prUrl?: string; hint?: string; notes?: string[] }
 ): Promise<void> {
   try {
-    const body = buildStatusComment(stage, extra.category, extra.prUrl, extra.hint, extra.notes);
+    const config = getConfig();
+    const usageLine =
+      stage === "queued" || stage === "working"
+        ? undefined
+        : formatUsage(currentUsage(), { inputPerMTok: config.llmPriceInputPerMTok, outputPerMTok: config.llmPriceOutputPerMTok });
+    const body = buildStatusComment(stage, extra.category, extra.prUrl, extra.hint, extra.notes, usageLine);
     const existing = await gh.findBotComment(repo, issueNumber);
     if (existing) await gh.updateComment(repo, existing.id, body);
     else await gh.createComment(repo, issueNumber, body);
@@ -186,6 +192,10 @@ export async function markIssueQueued(event: GitHubIssueEvent): Promise<void> {
 const processingIssues = new Set<string>();
 
 export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = {}): Promise<JobOutcome> {
+  return withUsage(() => handleIssueInner(event, ctx));
+}
+
+async function handleIssueInner(event: GitHubIssueEvent, ctx: HandleContext): Promise<JobOutcome> {
   const config = getConfig();
   const { githubToken } = config;
   const gh = makeClient(githubToken);

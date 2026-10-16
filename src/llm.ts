@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { applyPatch } from "./patch.js";
 import { getConfig, getAdessoApiKey } from "./config.js";
+import { recordUsage } from "./usage.js";
 import {
   buildSingleShotPrompt,
   buildPlanPrompt,
@@ -117,6 +118,7 @@ async function ollamaChat(
       }
 
       const data = (await res.json()) as Record<string, unknown>;
+      recordUsage(model, data.prompt_eval_count as number | undefined, data.eval_count as number | undefined);
       const doneReason = data.done_reason as string | undefined;
 
       if (doneReason === "length") {
@@ -175,14 +177,18 @@ async function adessoChat(
     max_tokens: maxTokens,
     temperature: 0.2,
     stream: true,
+    stream_options: { include_usage: true },
   });
 
   let content = "";
   let finishReason: string | null | undefined;
+  let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
   for await (const chunk of stream) {
     content += chunk.choices[0]?.delta?.content ?? "";
     finishReason = chunk.choices[0]?.finish_reason ?? finishReason;
+    if (chunk.usage) usage = chunk.usage;
   }
+  recordUsage(model, usage?.prompt_tokens, usage?.completion_tokens);
   if (finishReason === "length") {
     throw new TruncatedResponseError(maxTokens);
   }

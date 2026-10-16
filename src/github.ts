@@ -372,7 +372,8 @@ export function buildStatusComment(
   errorCategory?: string,
   prUrl?: string,
   hint?: string,
-  notes: string[] = []
+  notes: string[] = [],
+  usageLine?: string
 ): string {
   let text = `${BOT_COMMENT_MARKER}\n\n`;
   const clean = (s: string) => redact(s.replace(/\s+at\s+\S+/g, "").replace(/\n{2,}/g, "\n").trim());
@@ -409,6 +410,7 @@ export function buildStatusComment(
   if (notes.length > 0) {
     text += "\n\n**Notes:**\n" + notes.map((n) => `- ${clean(n)}`).join("\n");
   }
+  if (usageLine) text += `\n\n${usageLine}`;
 
   return text;
 }
