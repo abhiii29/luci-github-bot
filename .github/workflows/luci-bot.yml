@@ -34,8 +34,10 @@ on:
       adesso-api-key:
         required: true
 
+# actions: write is for the per-issue state cache; the bot itself uses bot-token
 permissions:
   contents: read
+  actions: write
 
 jobs:
   run:

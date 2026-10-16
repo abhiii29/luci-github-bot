@@ -13,6 +13,11 @@ concurrency:
   group: luci-bot-${{ github.event.issue.number }}
   cancel-in-progress: false
 
+# The reusable workflow saves per-issue state to the Actions cache
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   bot:
     # Skip runner start-up for events the bot would ignore anyway
