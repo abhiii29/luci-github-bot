@@ -122,45 +122,95 @@ function substituteTemplate(template: string, values: string[]): string {
   return template.replace(/%s/g, () => values.shift() ?? "");
 }
 
+const THINK_TAG_RE = /<\?xml[^>]*>|<think[^>]*>[\s\S]*?<\/think>|<\/?think>/gi;
+
+export function stripThinkingTags(content: string): string {
+  return content.replace(THINK_TAG_RE, "").trim();
+}
+
+export function stripMarkdownFences(content: string): string {
+  return content.replace(/```(?:json)?\s*\n([\s\S]*?)\n```/g, "$1").trim();
+}
+
 async function ollamaChat(
   baseUrl: string,
   model: string,
   systemPrompt: string,
   userPrompt: string,
-  maxTokens: number
+  maxTokens: number,
+  timeoutMs: number = 300_000
 ): Promise<string> {
   const url = `${baseUrl}/api/chat`;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 300_000);
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      stream: false,
-      options: {
-        num_predict: maxTokens,
-        temperature: 0.3,
-      },
-    }),
-    signal: controller.signal,
+  const body = JSON.stringify({
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    stream: false,
+    options: {
+      num_predict: maxTokens,
+      temperature: 0.3,
+    },
   });
 
-  clearTimeout(timeoutId);
+  let lastError: Error | null = null;
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Ollama ${res.status}: ${body.slice(0, 500)}`);
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok && res.status >= 500) {
+        const bodyText = await res.text();
+        lastError = new Error(`Ollama ${res.status}: ${bodyText.slice(0, 500)}`);
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+        throw lastError;
+      }
+
+      if (!res.ok) {
+        const bodyText = await res.text();
+        throw new Error(`Ollama ${res.status}: ${bodyText.slice(0, 500)}`);
+      }
+
+      const data = (await res.json()) as Record<string, unknown>;
+      const doneReason = data.done_reason as string | undefined;
+
+      if (doneReason === "length") {
+        console.warn("[llm] Ollama response truncated (max tokens reached)");
+      }
+
+      const msg = data.message as Record<string, unknown> | undefined;
+      let content = (msg?.content as string) ?? "";
+      content = stripThinkingTags(content);
+      content = stripMarkdownFences(content);
+      return content;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (err instanceof Error && (err.name === "AbortError" || err.message.includes("fetch failed"))) {
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+      }
+      throw lastError;
+    }
   }
 
-  const data = (await res.json()) as Record<string, unknown>;
-  const msg = data.message as Record<string, unknown> | undefined;
-  return (msg?.content as string) ?? "";
+  throw lastError ?? new Error("Ollama chat failed after retries");
 }
 
 async function adessoChat(
@@ -319,6 +369,104 @@ export async function generateSolution(
 // Phase 1: Decomposition (local model)
 // ---------------------------------------------------------------------------
 
+/** Validate decomposition subtasks. Returns errors and warnings. */
+export function validateDecomposition(subtasks: Subtask[], maxSubtasks: number, maxFiles: number): { errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const ids = new Set<string>();
+
+  if (subtasks.length > maxSubtasks) {
+    errors.push(`Too many subtasks (${subtasks.length}, max ${maxSubtasks})`);
+  }
+
+  for (const st of subtasks) {
+    if (ids.has(st.id)) {
+      errors.push(`Duplicate subtask id: ${st.id}`);
+    }
+    ids.add(st.id);
+
+    if (st.files.length > maxFiles) {
+      errors.push(`Subtask ${st.id} has ${st.files.length} files (max ${maxFiles})`);
+    }
+
+    for (const dep of st.dependencies) {
+      if (!ids.has(dep) && !subtasks.find((s) => s.id === dep)) {
+        errors.push(`Subtask ${st.id} depends on unknown id: ${dep}`);
+      }
+      if (dep === st.id) {
+        errors.push(`Subtask ${st.id} has self-dependency`);
+      }
+    }
+
+    for (const f of st.files) {
+      if (!/^[a-zA-Z0-9_./\-]+$/ .test(f)) {
+        warnings.push(`Subtask ${st.id} has non-normalized file path: ${f}`);
+      }
+    }
+  }
+
+  // Cycle detection (simple DFS)
+  const adj = new Map<string, string[]>();
+  for (const st of subtasks) adj.set(st.id, st.dependencies.filter((d) => ids.has(d)));
+  const visited = new Set<string>();
+  const inStack = new Set<string>();
+
+  function hasCycle(node: string): boolean {
+    if (inStack.has(node)) return true;
+    if (visited.has(node)) return false;
+    visited.add(node);
+    inStack.add(node);
+    for (const dep of adj.get(node) ?? []) {
+      if (hasCycle(dep)) return true;
+    }
+    inStack.delete(node);
+    return false;
+  }
+
+  for (const id of ids) {
+    if (hasCycle(id)) {
+      errors.push("Subtask dependency cycle detected");
+      break;
+    }
+  }
+
+  return { errors, warnings };
+}
+
+/** Repair a subtask result that has no FILE blocks or appears truncated. */
+async function repairSubtask(
+  subtask: Subtask,
+  repoContext: string,
+  existingFiles: string[],
+  branchName: string,
+  githubToken: string | undefined,
+  fileContents: Record<string, string>,
+  config: ReturnType<typeof import("./config.js").getConfig>,
+  executionMaxTokens: number
+): Promise<CodeGenerationResult> {
+  const filesList = subtask.files.map((f) => `  - ${f}`).join("\n") || "  (none specified)";
+  const fileContexts: string[] = [];
+  for (const filePath of subtask.files) {
+    const content = fileContents[filePath];
+    if (content) {
+      fileContexts.push(`\n--- CURRENT CONTENT OF ${filePath} ---\n${content}`);
+    }
+  }
+  const fileContextBlock = fileContexts.length > 0 ? fileContexts.join("\n\n") : "(No existing content available)";
+
+  const prompt = `REPOSITORY: ${repoContext}\n\nSUBTASK (ID: ${subtask.id}): ${subtask.description}\n\nFILES: ${filesList}\n\n${fileContextBlock}\n\nPrevious output had no valid FILE blocks or was truncated. Please provide the COMPLETE file content for each file listed above. Output only the structured response.`;
+
+  const content = await ollamaChat(
+    config.ollamaBaseUrl,
+    config.ollamaModel,
+    EXECUTION_SYSTEM_PROMPT,
+    prompt,
+    executionMaxTokens
+  );
+
+  return parseLLMResponse(content);
+}
+
 async function decomposeIssue(
   issueTitle: string,
   issueBody: string,
@@ -341,7 +489,8 @@ async function decomposeIssue(
     config.ollamaModel,
     DECOMPOSITION_SYSTEM_PROMPT,
     prompt,
-    4000
+    4000,
+    config.ollamaDecompositionTimeoutMs
   );
 
   const result = parseDecompositionResponse(content);
@@ -370,10 +519,9 @@ async function executeSubtask(
   branchName: string,
   _githubToken: string | undefined,
   fileContents: Record<string, string>,
+  config: ReturnType<typeof import("./config.js").getConfig>,
   retryCount: number = 0
 ): Promise<CodeGenerationResult> {
-  const config = getConfig();
-
   const filesList = subtask.files.map((f) => `  - ${f}`).join("\n") || "  (none specified)";
 
   const fileContexts: string[] = [];
@@ -405,28 +553,41 @@ async function executeSubtask(
     config.ollamaModel,
     EXECUTION_SYSTEM_PROMPT,
     prompt,
-    12000
+    12000,
+    config.ollamaSubtaskTimeoutMs
   );
 
   let result = parseLLMResponse(content);
 
   if (!result.success && retryCount < 1) {
-    const retryPrompt = prompt + "\n\nPrevious attempt failed to parse. Re-output using the exact format: BRANCH on first line, COMMIT on second, then FILE_START/FILE_END blocks.";
-    const retryContent = await ollamaChat(
+    console.warn(`[llm] Subtask ${subtask.id} failed, retrying with repair prompt...`);
+    const repairPrompt = `REPOSITORY: ${repoContext}
+
+SUBTASK (ID: ${subtask.id}): ${subtask.description}
+
+FILES: ${filesList}
+
+${fileContextBlock}
+
+Previous output had no valid FILE blocks or was truncated. Please provide the COMPLETE file content for each file listed above. Output only the structured response with BRANCH, COMMIT, and FILE_START/FILE_END blocks.`;
+
+    const repaired = await ollamaChat(
       config.ollamaBaseUrl,
       config.ollamaModel,
       EXECUTION_SYSTEM_PROMPT,
-      retryPrompt,
-      12000
+      repairPrompt,
+      12000,
+      config.ollamaSubtaskTimeoutMs
     );
-    result = parseLLMResponse(retryContent);
+
+    result = parseLLMResponse(repaired);
   }
 
   if (!result.success) {
     return {
       ...result,
       branchName,
-      error: `Subtask ${subtask.id} failed: ${result.error}`,
+      error: `Subtask ${subtask.id} failed after retry: ${result.error}`,
     };
   }
 
@@ -507,6 +668,32 @@ export async function generateSolutionWithDecomposition(
 
   console.log(`[llm] Phase 1: ${decomposition.subtasks.length} subtask(s) identified`);
 
+  // Validate decomposition structure
+  const config = getConfig();
+  const MAX_SUBTASKS = 12;
+  const MAX_FILES_PER_SUBTASK = 20;
+  const validation = validateDecomposition(
+    decomposition.subtasks,
+    MAX_SUBTASKS,
+    MAX_FILES_PER_SUBTASK
+  );
+
+  if (validation.errors.length > 0) {
+    const msg = `Invalid decomposition: ${validation.errors.join("; ")}`;
+    console.error(`[llm] ${msg}`);
+    return {
+      success: false,
+      files: [],
+      branchName: "",
+      commitMessage: "",
+      error: msg,
+    };
+  }
+
+  if (validation.warnings.length > 0) {
+    console.warn(`[llm] Decomposition warnings: ${validation.warnings.join("; ")}`);
+  }
+
   let fileContents: Record<string, string> = {};
   if (githubToken) {
     const allFiles = new Set(decomposition.subtasks.flatMap((st) => st.files));
@@ -529,7 +716,7 @@ export async function generateSolutionWithDecomposition(
 
     if (ready.length === 0) {
       for (const st of remaining) {
-        const result = await executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, 0);
+        const result = await executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, config, 0);
         executed.push(result);
         resolved.add(st.id);
       }
@@ -537,7 +724,7 @@ export async function generateSolutionWithDecomposition(
     }
 
     console.log(`[llm] Phase 2: Executing ${ready.length} subtask(s) in parallel...`);
-    const tasks = ready.map((st) => executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, 0));
+    const tasks = ready.map((st) => executeSubtask(st, repoContext, existingFiles, decomposition.branchName, githubToken, fileContents, config, 0));
     const batchResults = await Promise.all(tasks);
     executed.push(...batchResults);
 
