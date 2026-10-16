@@ -1,0 +1,34 @@
+# Copy to .github/workflows/luci-bot.yml in each repo the bot should work on.
+# Repo secrets needed: LUCI_BOT_TOKEN, ADESSO_API_KEY. See docs/GITHUB_ACTION.md.
+name: luci-bot (this repo)
+
+on:
+  issues:
+    types: [assigned, labeled, edited]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  bot:
+    # Skip runner start-up for events the bot would ignore anyway
+    if: >-
+      !github.event.issue.pull_request && (
+        (github.event_name == 'issues' && (
+          github.event.action == 'assigned' ||
+          (github.event.action == 'labeled' && github.event.label.name == 'needs-retry') ||
+          github.event.action == 'edited')) ||
+        (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/luci')))
+    # Job-level, so events the `if` skips (e.g. the bot's own comments and labels) never join the
+    # group: GitHub keeps one waiting run per group and would cancel a real one in their favour.
+    concurrency:
+      group: luci-bot-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    uses: abhiii29/luci-github-bot/.github/workflows/luci-bot.yml@main
+    with:
+      bot-username: abhiii29
+    secrets:
+      bot-token: ${{ secrets.LUCI_BOT_TOKEN }}
+      adesso-api-key: ${{ secrets.ADESSO_API_KEY }}
