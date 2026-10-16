@@ -299,6 +299,14 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
           false
         );
       }
+      if (solution.error?.includes("truncated")) {
+        return await fail(
+          "truncated",
+          "The change is too large for one model answer. Narrow the issue (list fewer files) and reply `/luci plan`.",
+          false,
+          solution.error
+        );
+      }
       return await fail("llm_generation", "The model's answer could not be used. It will be retried automatically.", true, solution.error);
     }
 
