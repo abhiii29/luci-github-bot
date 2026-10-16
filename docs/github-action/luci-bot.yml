@@ -20,7 +20,7 @@ jobs:
           github.event.action == 'assigned' ||
           (github.event.action == 'labeled' && github.event.label.name == 'needs-retry') ||
           github.event.action == 'edited')) ||
-        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/luci')))
+        (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/luci')))
     # Job-level, so events the `if` skips (e.g. the bot's own comments and labels) never join the
     # group: GitHub keeps one waiting run per group and would cancel a real one in their favour.
     concurrency:

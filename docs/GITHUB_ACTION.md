@@ -15,7 +15,7 @@ The same routing, queue, validation and container worker as the webhook server a
 3. If this bot repo is private, allow access to its workflows:
    bot repo → Settings → Actions → General → Access → "Accessible from repositories owned by …".
 
-Assign an issue to the bot user, as before.
+Assign an issue to the bot user, as before. `/luci` commands must start the comment.
 
 ## Inputs (reusable workflow `.github/workflows/luci-bot.yml`)
 
