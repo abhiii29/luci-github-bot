@@ -106,7 +106,14 @@ const gh = {
   collaborators: new Set<string>(["maintainer", "reporter"]),
   nextId: 1,
 };
-function ghFetch(input: any, init: any = {}): Promise<Response> {
+// Real GitHub has latency; random delays make ordering races (two bot:* labels, duplicate
+// status comments) show up here instead of only on a live repo.
+async function ghFetch(input: any, init: any = {}): Promise<Response> {
+  await new Promise((r) => setTimeout(r, Math.random() * 8));
+  return ghRoute(input, init);
+}
+
+function ghRoute(input: any, init: any = {}): Promise<Response> {
   const url = new URL(String(input));
   const method = (init.method ?? "GET").toUpperCase();
   const p = url.pathname.replace(`/repos/${REPO}`, "");

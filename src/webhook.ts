@@ -7,7 +7,7 @@ import { metrics } from "./metrics.js";
 import { JsonQueueStore } from "./store.js";
 import { clearCollaboratorCache } from "./collaborators.js";
 import { computeJobOptions, clearRepoConfigCache } from "./job-context.js";
-import { enqueueIssue, isDispatchReady } from "./dispatch.js";
+import { enqueueIssue, isDispatchReady, openJobFor } from "./dispatch.js";
 import type { GitHubCommentEvent } from "./command-handler.js";
 import type { ResolvedJobOptions } from "./job-options.js";
 import { logger } from "./logger.js";
@@ -355,14 +355,17 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
       }
 
       if (isDispatchReady()) {
+        if (openJobFor(event.repository.full_name, event.issue.number)) {
+          return res.status(200).json({ status: "ignored", reason: "already_queued" });
+        }
+        // Mark as queued first: enqueueing can start the job immediately, and its status updates
+        // must come after this one.
+        if (queuedHandler) queuedHandler(event).catch(() => {});
         const r = enqueueIssue(event);
         if (r.status === "already_queued") {
           return res.status(200).json({ status: "ignored", reason: "already_queued" });
         }
         metrics.recordQueue();
-        if (queuedHandler) {
-          queuedHandler(event).catch(() => {});
-        }
         return res.status(200).json({ status: "queued" });
       }
 

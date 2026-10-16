@@ -40,17 +40,30 @@ function makeClient(githubToken: string): GitHubClient {
   return new GitHubClient({ token: githubToken, retries: 2 });
 }
 
-async function setStatusLabel(gh: GitHubClient, repo: string, issueNumber: number, status: StatusCode): Promise<void> {
-  try {
-    await gh.setLabels(repo, issueNumber, status);
-  } catch (err) {
-    console.warn(`[handler] Failed to set label ${status}: ${redact(err instanceof Error ? err.message : String(err))}`);
-  }
+function setStatusLabel(gh: GitHubClient, repo: string, issueNumber: number, status: StatusCode): Promise<void> {
+  return serialized(repo, issueNumber, async () => {
+    try {
+      await gh.setLabels(repo, issueNumber, status);
+    } catch (err) {
+      console.warn(`[handler] Failed to set label ${status}: ${redact(err instanceof Error ? err.message : String(err))}`);
+    }
+  });
 }
 
-// Status-comment writes for one issue are serialized: two concurrent "find, else create" calls
-// would otherwise both create a comment.
-const statusCommentLocks = new Map<string, Promise<void>>();
+// All status writes for one issue (label + comment) are serialized in call order. Otherwise the
+// "queued" update and the handler's "working" update interleave and leave two bot:* labels or a
+// stale/duplicate status comment.
+const statusLocks = new Map<string, Promise<void>>();
+
+function serialized(repo: string, issueNumber: number, fn: () => Promise<void>): Promise<void> {
+  const key = `${repo}#${issueNumber}`;
+  const next = (statusLocks.get(key) ?? Promise.resolve()).then(fn, fn);
+  statusLocks.set(key, next);
+  void next.finally(() => {
+    if (statusLocks.get(key) === next) statusLocks.delete(key);
+  });
+  return next;
+}
 
 function updateStatusComment(
   gh: GitHubClient,
@@ -59,14 +72,7 @@ function updateStatusComment(
   stage: StatusStage,
   extra: { category?: string; prUrl?: string; hint?: string; notes?: string[] } = {}
 ): Promise<void> {
-  const key = `${repo}#${issueNumber}`;
-  const prev = statusCommentLocks.get(key) ?? Promise.resolve();
-  const next = prev.then(() => writeStatusComment(gh, repo, issueNumber, stage, extra));
-  statusCommentLocks.set(key, next);
-  void next.finally(() => {
-    if (statusCommentLocks.get(key) === next) statusCommentLocks.delete(key);
-  });
-  return next;
+  return serialized(repo, issueNumber, () => writeStatusComment(gh, repo, issueNumber, stage, extra));
 }
 
 async function writeStatusComment(
@@ -132,15 +138,20 @@ export async function retryQueuedIssue(event: GitHubIssueEvent): Promise<void> {
   } catch {
     /* label may not exist */
   }
-  await setStatusLabel(gh, repo, issueNumber, "bot:queued");
-  await updateStatusComment(gh, repo, issueNumber, "queued");
+  await Promise.all([
+    setStatusLabel(gh, repo, issueNumber, "bot:queued"),
+    updateStatusComment(gh, repo, issueNumber, "queued"),
+  ]);
 }
 
 /** Mark an issue as queued on GitHub (called when a job is enqueued). */
 export async function markIssueQueued(event: GitHubIssueEvent): Promise<void> {
   const gh = makeClient(getConfig().githubToken);
-  await setStatusLabel(gh, event.repository.full_name, event.issue.number, "bot:queued");
-  await updateStatusComment(gh, event.repository.full_name, event.issue.number, "queued");
+  // Both writes are queued synchronously, so they land before anything the job does afterwards
+  await Promise.all([
+    setStatusLabel(gh, event.repository.full_name, event.issue.number, "bot:queued"),
+    updateStatusComment(gh, event.repository.full_name, event.issue.number, "queued"),
+  ]);
 }
 
 // ── handleIssue ─────────────────────────────────────────────────────────

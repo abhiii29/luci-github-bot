@@ -36,6 +36,10 @@ export function enqueueIssue(event: GitHubIssueEvent): EnqueueResult {
   return { status: "queued", jobId };
 }
 
+export function openJobFor(repo: string, issueNumber: number): JobRecord | undefined {
+  return store?.getOpenJobPerIssue(repo, issueNumber);
+}
+
 export type CancelResult = "cancelled" | "cancelling" | "none";
 
 /**

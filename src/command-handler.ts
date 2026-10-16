@@ -1,6 +1,6 @@
 import { handleCommentCommand, type CommandHooks } from "./commands.js";
 import { getConfig } from "./config.js";
-import { cancelIssue, enqueueIssue, latestJobForIssue } from "./dispatch.js";
+import { cancelIssue, enqueueIssue, latestJobForIssue, openJobFor } from "./dispatch.js";
 import { GitHubClient, redact } from "./github.js";
 import { computeJobOptions } from "./job-context.js";
 import { approvePlan, cancelPlan, getPlanState, hashIssueBody, planKeyFor } from "./plan.js";
@@ -30,10 +30,12 @@ async function enqueueWith(
   const opts = await computeJobOptions(event, getConfig().githubToken);
   tweak(opts);
   event.jobOptions = opts;
+  const open = openJobFor(event.repository.full_name, event.issue.number);
+  if (open) return `@${username} a job for this issue is already ${open.status}.`;
+  const marked = markIssueQueued(event); // before enqueue: the job may start immediately
   const r = enqueueIssue(event);
-  if (r.status === "already_queued") return `@${username} a job for this issue is already ${r.job.status}.`;
   if (r.status === "unavailable") return `@${username} the job queue is not available right now.`;
-  await markIssueQueued(event);
+  await marked;
   return `@${username} ${what} queued.`;
 }
 
