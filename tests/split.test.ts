@@ -7,8 +7,8 @@ import {
   createSplitIssues,
   nextPartAfterMerge,
   type SplitGitHub,
-  type PlanPart,
 } from "../src/split.js";
+import type { PlanPart } from "../src/plan.js";
 
 describe("split", () => {
   const parent = { number: 100, title: "Big Feature" };
@@ -30,7 +30,7 @@ describe("split", () => {
     });
 
     it("omits optional lines when not provided", () => {
-      const body = partIssueBody(parent, parts[1], 2, 2);
+      const body = partIssueBody(parent, { ...parts[1], files: [] }, 2, 2);
       expect(body).not.toContain("Files to focus on:");
       expect(body).not.toContain("Depends on #");
     });
@@ -68,10 +68,10 @@ describe("split", () => {
       expect(numbers).toEqual([201, 202]);
       expect(gh.createIssue).toHaveBeenCalledTimes(2);
       
-      const firstBody = gh.createIssue.mock.calls[0][2] as string;
+      const firstBody = vi.mocked(gh.createIssue).mock.calls[0][2] as string;
       expect(firstBody).not.toContain("Depends on #");
       
-      const secondBody = gh.createIssue.mock.calls[1][2] as string;
+      const secondBody = vi.mocked(gh.createIssue).mock.calls[1][2] as string;
       expect(secondBody).toContain("Depends on #201 (merged first).");
 
       expect(gh.createComment).toHaveBeenCalledWith("owner/repo", 100, expect.stringContaining("1. #201"));
@@ -86,12 +86,12 @@ describe("split", () => {
     } as unknown as SplitGitHub;
 
     it("returns next when index < list length", async () => {
-      gh.getIssue.mockResolvedValue({
+      vi.mocked(gh.getIssue).mockResolvedValue({
         number: 201,
         author: "luci-bot",
         body: partIssueBody(parent, parts[0], 1, 2, undefined),
       });
-      gh.findCommentWithMarker.mockResolvedValue({
+      vi.mocked(gh.findCommentWithMarker).mockResolvedValue({
         id: 1,
         body: partsComment([201, 202]),
       });
@@ -101,12 +101,12 @@ describe("split", () => {
     });
 
     it("returns done when index === list length", async () => {
-      gh.getIssue.mockResolvedValue({
+      vi.mocked(gh.getIssue).mockResolvedValue({
         number: 202,
         author: "luci-bot",
         body: partIssueBody(parent, parts[1], 2, 2, 201),
       });
-      gh.findCommentWithMarker.mockResolvedValue({
+      vi.mocked(gh.findCommentWithMarker).mockResolvedValue({
         id: 1,
         body: partsComment([201, 202]),
       });
@@ -116,7 +116,27 @@ describe("split", () => {
     });
 
     it("returns null if author does not match botUsername", async () => {
-      gh.getIssue.mockResolvedValue({
+      vi.mocked(gh.getIssue).mockResolvedValue({
         number: 201,
         author: "other-user",
-        body: partIssueBody(parent, parts[0], 1,
+        body: partIssueBody(parent, parts[0], 1, 2),
+      } as never);
+      expect(await nextPartAfterMerge(gh, "owner/repo", 201, "luci-bot")).toBeNull();
+    });
+
+    it("returns null when the issue has no part marker", async () => {
+      vi.mocked(gh.getIssue).mockResolvedValue({ number: 201, author: "luci-bot", body: "plain issue" } as never);
+      expect(await nextPartAfterMerge(gh, "owner/repo", 201, "luci-bot")).toBeNull();
+    });
+
+    it("returns null when the merged issue is not in the parts list", async () => {
+      vi.mocked(gh.getIssue).mockResolvedValue({
+        number: 999,
+        author: "luci-bot",
+        body: partIssueBody(parent, parts[0], 1, 2),
+      } as never);
+      vi.mocked(gh.findCommentWithMarker).mockResolvedValue({ id: 1, body: partsComment([201, 202]) } as never);
+      expect(await nextPartAfterMerge(gh, "owner/repo", 999, "luci-bot")).toBeNull();
+    });
+  });
+});
