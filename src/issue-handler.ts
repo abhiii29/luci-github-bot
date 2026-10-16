@@ -7,6 +7,7 @@ import {
   extractLocalPrompt,
   fetchFileContent,
   type CodeGenerationResult,
+  TruncatedResponseError,
 } from "./llm.js";
 import { guardChanges } from "./change-guard.js";
 import { DockerWorker, type WorkerProgress } from "./docker-worker.js";
@@ -427,6 +428,14 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
     return { success: true, prUrl };
   } catch (error) {
     const errorMsg = redact(error instanceof Error ? error.message : String(error));
+    if (error instanceof TruncatedResponseError) {
+      return await fail(
+        "truncated",
+        "The model's answer was too long and got cut off. Narrow the issue (fewer files or steps) and reply `/luci plan`.",
+        false,
+        errorMsg
+      );
+    }
     console.error(`[handler] Unexpected error for ${issueKey}: ${errorMsg}`);
     return await fail("unexpected", "An unexpected error occurred. It will be retried automatically; check the bot logs.", true, errorMsg);
   } finally {
