@@ -9,6 +9,7 @@
 import fs from "fs";
 import path from "path";
 import { getConfig } from "./config.js";
+import { MAX_PARTS } from "./prompts.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -20,6 +21,13 @@ export interface PlanFile {
   operation: "create" | "update" | "delete";
 }
 
+/** One sub-issue of a plan that is too big for a single PR. */
+export interface PlanPart {
+  title: string;
+  scope: string;
+  files: string[];
+}
+
 export interface Plan {
   branchName: string;
   commitMessage: string;
@@ -27,6 +35,8 @@ export interface Plan {
   approach: string;
   risks: string[];
   openQuestions: string[];
+  /** Present (2+ entries) when the work should be split into sub-issues, in merge order. */
+  parts?: PlanPart[];
   createdAt: string;
   issueBodyHash?: string;
 }
@@ -277,6 +287,7 @@ export function parsePlanOutput(raw: string, _issueBody: string): Plan {
   const risks: string[] = [];
   const questions: string[] = [];
   const fileEntries: Array<{ path: string; operation: string; reason: string }> = [];
+  const parts: PlanPart[] = [];
 
   for (const line of lines) {
     if (line.startsWith("BRANCH: ")) {
@@ -289,6 +300,11 @@ export function parsePlanOutput(raw: string, _issueBody: string): Plan {
       risks.push(line.slice(6).trim());
     } else if (line.startsWith("QUESTION: ")) {
       questions.push(line.slice(10).trim());
+    } else if (line.startsWith("PART: ")) {
+      const [title, scope, files] = line.slice(6).split("::").map((x) => x.trim());
+      if (title && scope) {
+        parts.push({ title, scope, files: (files ?? "").split(",").map((f) => f.trim()).filter(Boolean) });
+      }
     } else if (line.startsWith("FILES: ")) {
       const rest = line.slice(7).trim();
       // Parse path:operation:reason
@@ -317,6 +333,7 @@ export function parsePlanOutput(raw: string, _issueBody: string): Plan {
     approach: approach || "TBD",
     risks,
     openQuestions: questions,
+    ...(parts.length >= 2 ? { parts: parts.slice(0, MAX_PARTS) } : {}),
     createdAt: new Date().toISOString(),
   };
 }

@@ -198,3 +198,30 @@ describe("getApprovedFiles", () => {
     expect(files).toHaveLength(0);
   });
 });
+
+describe("parsePlanOutput: split into parts", () => {
+  it("collects PART lines in merge order", () => {
+    const plan = parsePlanOutput(
+      [
+        "APPROACH: Two stages.",
+        "FILES: src/a.ts:update:first part",
+        "PART: Data model :: Add the store. :: src/a.ts, src/b.ts",
+        "PART: UI :: Show it :: Uses a :: separator. :: src/ui.ts",
+      ].join("\n"),
+      ""
+    );
+    expect(plan.parts).toHaveLength(2);
+    expect(plan.parts![0]).toEqual({ title: "Data model", scope: "Add the store.", files: ["src/a.ts", "src/b.ts"] });
+    expect(plan.parts![1].title).toBe("UI");
+  });
+
+  it("ignores a single PART and malformed lines", () => {
+    expect(parsePlanOutput("PART: Only one :: x :: a.ts", "").parts).toBeUndefined();
+    expect(parsePlanOutput("PART: no scope\nPART: also none", "").parts).toBeUndefined();
+  });
+
+  it("caps the number of parts", () => {
+    const raw = Array.from({ length: 9 }, (_, i) => `PART: P${i} :: s :: f${i}.ts`).join("\n");
+    expect(parsePlanOutput(raw, "").parts).toHaveLength(6);
+  });
+});
