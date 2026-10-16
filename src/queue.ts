@@ -18,6 +18,7 @@ export class JobQueue {
   private processor: JobProcessor | null = null;
   private running = false;
   private runningJobs = new Set<string>();
+  private pendingRetries = 0;
   private maxConcurrent: number;
 
   constructor(store: JsonQueueStore, maxConcurrent: number = 1) {
@@ -44,7 +45,7 @@ export class JobQueue {
   async stop(timeoutMs = 60_000): Promise<void> {
     this.running = false;
     const deadline = Date.now() + timeoutMs;
-    while (this.runningJobs.size > 0 && Date.now() < deadline) {
+    while ((this.runningJobs.size > 0 || this.pendingRetries > 0) && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 200));
     }
     if (this.runningJobs.size > 0) {
@@ -53,7 +54,7 @@ export class JobQueue {
   }
 
   isIdle(): boolean {
-    return this.runningJobs.size === 0 && this.getQueueDepth() === 0;
+    return this.runningJobs.size === 0 && this.pendingRetries === 0 && this.getQueueDepth() === 0;
   }
 
   enqueue(repo: string, issueNumber: number, payload: Record<string, unknown>): string {
@@ -105,7 +106,9 @@ export class JobQueue {
       // Exponential backoff: 1s, 2s, 4s...
       const delay = Math.min(1000 * Math.pow(2, job.attempts - 1), 30_000);
       console.log(`[queue] Job ${job.id} failed (attempt ${job.attempts}/${job.maxAttempts}), retrying in ${delay}ms`);
+      this.pendingRetries++;
       setTimeout(() => {
+        this.pendingRetries--;
         if (this.store.getJob(job.id)?.status === "cancelled") return;
         this.store.requeueJob(job.id);
         this.kick();

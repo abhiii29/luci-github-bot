@@ -47,7 +47,7 @@ export interface PlanState {
 function getPlanDir(): string {
   try {
     const config = getConfig();
-    const dataDir = (config as any).planDataDir ?? ".luci-bot-plans";
+    const dataDir = config.planDataDir ?? ".luci-bot-plans";
     return path.resolve(dataDir);
   } catch {
     return path.resolve(".luci-bot-plans");

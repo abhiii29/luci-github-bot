@@ -152,17 +152,11 @@ export class GitHubClient {
   }
 
   async setLabels(repo: string, issueNumber: number, statusLabel: StatusCode): Promise<void> {
-    // Remove all status labels, then add the new one
-    await Promise.allSettled(
-      STATUS_LABELS.map((l) =>
-        l === statusLabel
-          ? this.ensureLabel(repo, l)
-          : this.removeLabel(repo, issueNumber, l)
-      )
-    );
+    // Exactly one bot:* status label at a time; never touch any other label on the issue.
     const removals = STATUS_LABELS.filter((l) => l !== statusLabel);
     await Promise.allSettled(removals.map((l) => this.removeLabel(repo, issueNumber, l)));
     await this.ensureLabel(repo, statusLabel);
+    await this.addLabels(repo, issueNumber, [statusLabel]);
   }
 
   private async ensureLabel(repo: string, label: string): Promise<void> {
@@ -234,7 +228,8 @@ export class GitHubClient {
 
   async getPullRequestForBranch(repo: string, branch: string): Promise<{ url: string } | undefined> {
     const res = await this.fetchWithRetry(
-      `https://api.github.com/repos/${repo}/pulls?head=${branch}&state=all&per_page=1`,
+      // `head` must be "owner:branch"; with a bare branch GitHub ignores the filter.
+      `https://api.github.com/repos/${repo}/pulls?head=${encodeURIComponent(`${repo.split("/")[0]}:${branch}`)}&state=all&per_page=1`,
       { headers: this.headers() }
     );
     const data = await res.json() as Array<{ html_url: string }>;

@@ -93,6 +93,16 @@ export interface CommentResponse {
 
 export type CollaboratorCheck = (owner: string, repo: string, username: string) => Promise<boolean>;
 
+/** Live implementations for commands; each returns the reply to post. */
+export interface CommandHooks {
+  retry?: (username: string) => Promise<string>;
+  cancel?: (username: string) => Promise<string>;
+  status?: (username: string) => Promise<string>;
+  explain?: (username: string) => Promise<string>;
+  plan?: (username: string) => Promise<string>;
+  go?: (username: string) => Promise<string>;
+}
+
 /**
  * Handle a /luci command on an issue comment.
  */
@@ -101,6 +111,7 @@ export async function handleCommentCommand(
   onRetry?: () => Promise<void>,
   onCancel?: () => Promise<void>,
   collaboratorCheck?: CollaboratorCheck,
+  hooks: CommandHooks = {},
 ): Promise<CommentResponse> {
   const { owner, repo, issueNumber, username, body, isBot, labels = [] } = payload;
   const checkCollab = collaboratorCheck ?? isCollaborator;
@@ -130,6 +141,15 @@ export async function handleCommentCommand(
   const cmd = parseCommand(trimmed);
   if (!cmd) {
     return { reply: "", status: "ok" };
+  }
+
+  const hook = hooks[cmd.name];
+  if (hook) {
+    try {
+      return { reply: await hook(username), status: "ok" };
+    } catch (err) {
+      return { reply: `@${username} \`/luci ${cmd.name}\` failed: ${err instanceof Error ? err.message : String(err)}`, status: "error" };
+    }
   }
 
   const resolved = resolveLabelSwitches(labels);

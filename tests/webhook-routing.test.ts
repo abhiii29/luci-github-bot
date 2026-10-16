@@ -200,8 +200,8 @@ describe("Webhook HMAC + routing", () => {
     expect(res.body.status).toBe("ignored");
   });
 
-  it("ignores non-bot assignee (case-sensitive)", async () => {
+  it("matches the bot login case-insensitively (GitHub logins are case-insensitive)", async () => {
     const res = await send(makeIssuePayload({ issue: { assignee: { login: "Luci-Github-Bot" } } }));
-    expect(res.body.status).toBe("ignored");
+    expect(res.body.status).toBe("accepted");
   });
 });

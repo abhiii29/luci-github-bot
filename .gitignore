@@ -3,10 +3,11 @@ dist/
 .env
 *.log
 .DS_Store
-*.omo/
 .omo/
-.omo/*
-.omo/*/
 .handoff/
 *.sqlite*
 coverage/
+
+# Runtime state (job queue, pending plans)
+.luci-queue.json
+.luci-bot-plans/

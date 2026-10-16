@@ -194,17 +194,20 @@ describe("Trigger rules", () => {
     expect(handlerCalled).toBe(true);
   });
 
-  it("ignores reassignment from another user to the bot", async () => {
-    const res = await send(
-      makeIssuePayload({
-        changes: { assignee: { login: "previous-user" } },
-        issue: { assignee: { login: "luci-github-bot" } },
-        sender: { login: "reassigner" },
-      })
-    );
+  it("ignores an assigned event for another user even if the bot is the first assignee", async () => {
+    const payload = makeIssuePayload({ issue: { assignee: { login: "luci-github-bot" } } });
+    (payload as any).assignee = { login: "second-person" }; // the user that was just assigned
+    const res = await send(payload);
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("ignored");
     expect(handlerCalled).toBe(false);
+  });
+
+  it("processes a reassignment from a person to the bot", async () => {
+    const payload = makeIssuePayload({ issue: { assignee: { login: "someone-else" } } });
+    (payload as any).assignee = { login: "luci-github-bot" };
+    const res = await send(payload);
+    expect(res.body.status).toBe("accepted");
   });
 
   it("still supports needs-retry for edited action", async () => {

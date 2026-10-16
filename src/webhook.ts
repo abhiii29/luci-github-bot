@@ -5,20 +5,38 @@ import { DockerWorker } from "./docker-worker.js";
 import { ResourceStats } from "./resource-monitor.js";
 import { metrics } from "./metrics.js";
 import { JsonQueueStore } from "./store.js";
-import { parseDirectives } from "./directives.js";
-import { checkCollaborator, clearCollaboratorCache } from "./collaborators.js";
-import { loadRepoConfig } from "./repo-config.js";
+import { clearCollaboratorCache } from "./collaborators.js";
+import { computeJobOptions, clearRepoConfigCache } from "./job-context.js";
+import { enqueueIssue, isDispatchReady } from "./dispatch.js";
+import type { GitHubCommentEvent } from "./command-handler.js";
+import type { ResolvedJobOptions } from "./job-options.js";
 import { logger } from "./logger.js";
 import { redact } from "./redact.js";
-import type { JobOptions } from "./types.js";
 
 let dockerWorker: DockerWorker | null = null;
 type RetryHandler = (event: GitHubIssueEvent) => Promise<void>;
 let retryHandler: RetryHandler | null = null;
 let queueStore: JsonQueueStore | null = null;
 
-const repoConfigCache = new Map<string, { result: import("./repo-config.js").RepoConfigResult; timestamp: number }>();
-const REPO_CONFIG_CACHE_TTL_MS = 300_000;
+type EventHandler<T> = (event: T) => Promise<void>;
+let commentHandler: EventHandler<GitHubCommentEvent> | null = null;
+let editHandler: EventHandler<GitHubIssueEvent> | null = null;
+let queuedHandler: EventHandler<GitHubIssueEvent> | null = null;
+
+/** `/luci` commands on issue comments. */
+export function onComment(handler: EventHandler<GitHubCommentEvent>): void {
+  commentHandler = handler;
+}
+
+/** Issue body edited (used to invalidate pending plans). */
+export function onIssueEdited(handler: EventHandler<GitHubIssueEvent>): void {
+  editHandler = handler;
+}
+
+/** An assigned issue was put on the queue. */
+export function onQueued(handler: EventHandler<GitHubIssueEvent>): void {
+  queuedHandler = handler;
+}
 
 export function setDockerWorker(worker: DockerWorker): void {
   dockerWorker = worker;
@@ -35,8 +53,12 @@ export function setQueueStore(store: JsonQueueStore): void {
 export function __resetWebhookState(): void {
   handlers.length = 0;
   retryHandler = null;
+  commentHandler = null;
+  editHandler = null;
+  queuedHandler = null;
+  queueStore = null;
   clearCollaboratorCache();
-  repoConfigCache.clear();
+  clearRepoConfigCache();
 }
 
 export type HealthStats = {
@@ -81,8 +103,12 @@ export interface GitHubIssueEvent {
     private: boolean;
   };
   sender: { login: string };
-  changes?: { assignee?: { login?: string } };
-  jobOptions?: JobOptions;
+  /** For `assigned`: the user that was just assigned. */
+  assignee?: { login: string };
+  /** For `labeled`: the label that was just added. */
+  label?: { name: string };
+  changes?: { body?: { from: string }; title?: { from: string } };
+  jobOptions?: ResolvedJobOptions;
 }
 
 // Type guard for webhook event
@@ -100,7 +126,7 @@ function isGitHubIssueEvent(body: unknown): body is GitHubIssueEvent {
   );
 }
 
-type IssueHandler = (event: GitHubIssueEvent) => Promise<void>;
+type IssueHandler = (event: GitHubIssueEvent) => Promise<unknown>;
 
 const handlers: IssueHandler[] = [];
 
@@ -135,19 +161,30 @@ function rateLimitMiddleware(
   };
 }
 
+/** True only for requests made directly on this machine (not through ngrok or another proxy). */
+function isDirectLocalRequest(req: Request): boolean {
+  const addr = req.socket.remoteAddress ?? "";
+  const loopback = addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+  const proxied = !!(req.headers["x-forwarded-for"] || req.headers["x-forwarded-host"] || req.headers["ngrok-trace-id"]);
+  return loopback && !proxied;
+}
+
 function authMiddleware(config: ReturnType<typeof getConfig>): express.RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!config.apiToken) {
-      const host = req.headers.host || "localhost";
-      if (!host.includes("127.0.0.1") && !host.includes("localhost")) {
-        logger.warn("[webhook] /api/* accessed remotely without API_TOKEN", { ip: req.ip });
+      // Without API_TOKEN, /api/* is only reachable from this machine. (The Host header is
+      // client-controlled and ngrok traffic arrives from 127.0.0.1, so neither can be trusted.)
+      if (!isDirectLocalRequest(req)) {
+        logger.warn("[webhook] /api/* accessed remotely without API_TOKEN", { path: req.path });
         return res.status(403).json({ error: "API access denied" });
       }
       return next();
     }
 
-    const auth = req.headers.authorization;
-    if (!auth || auth !== `Bearer ${config.apiToken}`) {
+    const auth = req.headers.authorization ?? "";
+    const expected = `Bearer ${config.apiToken}`;
+    const ok = auth.length === expected.length && crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(expected));
+    if (!ok) {
       logger.warn("[webhook] Unauthorized /api/* access", { path: req.path });
       return res.status(401).json({ error: "Unauthorized" });
     }
@@ -172,12 +209,6 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
     realConfig.rateLimitWindowMs,
     realConfig.rateLimitMaxRequests
   ));
-
-  app.use(express.json({
-    verify: (req: Request, _res: Response, buf) => {
-      (req as any).rawBody = buf;
-    },
-  }));
 
   // Webhook endpoint
   app.post(
@@ -219,162 +250,132 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
         return res.status(400).json({ error: "Missing X-GitHub-Event header" });
       }
 
-      // Only handle issues events
-      if (eventType !== "issues") {
+      if (eventType === "ping") {
+        return res.status(200).json({ status: "pong" });
+      }
+
+      if (eventType !== "issues" && eventType !== "issue_comment") {
         logger.info("[webhook] Ignoring event type: " + eventType);
         return res.status(200).json({ status: "ignored" });
       }
 
       const body = req.body as unknown;
-
       if (!isGitHubIssueEvent(body)) {
         logger.error("[webhook] Invalid issue event payload");
         return res.status(400).json({ error: "Invalid payload" });
       }
 
-      const event = body;
-
-      // Check if repo is monitored
-      if (!appConfig.monitoredRepos.includes(event.repository.full_name)) {
+      if (!appConfig.monitoredRepos.includes(body.repository.full_name)) {
         logger.info(
-          `[webhook] Ignoring issue #${event.issue.number} from unmonitored repo: ${event.repository.full_name}`
+          `[webhook] Ignoring issue #${body.issue.number} from unmonitored repo: ${body.repository.full_name}`
         );
-        return res.status(200).json({ status: "ignored", repo: event.repository.full_name });
+        return res.status(200).json({ status: "ignored", repo: body.repository.full_name });
       }
 
-      // Handle retry trigger: needs-retry label on an open issue
-      if (event.action === "edited" && event.issue.state === "open") {
-        const hasRetryLabel = event.issue.labels.some(
-          (l) => l.name === "needs-retry"
-        );
-        if (hasRetryLabel && retryHandler) {
-          logger.info(
-            `[webhook] Retry triggered for issue #${event.issue.number} in ${event.repository.full_name}`
-          );
-          retryHandler(event).catch((error) => {
-            logger.error(
-              `[webhook] Retry handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
-            );
-          });
-          return res.status(200).json({ status: "retry", action: event.action });
-        }
+      // GitHub redelivers on timeouts and manual "Redeliver": process each delivery once
+      if (queueStore && deliveryId && queueStore.deliveryReceived(deliveryId)) {
+        logger.info(`[webhook] Duplicate delivery ${deliveryId}, ignoring`);
+        return res.status(200).json({ status: "ignored", reason: "duplicate" });
       }
 
-      if (event.action === "assigned" && event.issue.assignee) {
-        // Skip if the bot assigned itself
-        if (event.sender.login === appConfig.botUsername) {
-          logger.info(
-            `[webhook] Ignoring self-assignment #${event.issue.number}`
-          );
+      const isBotLogin = (login: string | undefined) =>
+        !!login && !!appConfig.botUsername && login.toLowerCase() === appConfig.botUsername.toLowerCase();
+
+      // ── /luci comment commands ──
+      if (eventType === "issue_comment") {
+        const c = body as unknown as GitHubCommentEvent;
+        if (c.action !== "created" || !c.comment || c.issue.pull_request) {
           return res.status(200).json({ status: "ignored" });
         }
-
-        // Skip closed issues
-        if (event.issue.state === "closed") {
-          logger.info(
-            `[webhook] Ignoring closed issue #${event.issue.number}`
-          );
+        if (!/^\s*\/luci\b/im.test(c.comment.body ?? "") || isBotLogin(c.comment.user?.login) || c.comment.user?.type === "Bot") {
           return res.status(200).json({ status: "ignored" });
         }
-
-        // Skip pull requests (issues with pull_request field)
-        if (event.issue.pull_request) {
-          logger.info(
-            `[webhook] Ignoring PR #${event.issue.number}`
-          );
-          return res.status(200).json({ status: "ignored" });
-        }
-
-        // Skip issues with bot:no-run label
-        if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
-          logger.info(
-            `[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`
-          );
-          return res.status(200).json({ status: "ignored" });
-        }
-
-        // Skip reassignments from another user to the bot
-        if (event.changes?.assignee?.login) {
-          logger.info(
-            `[webhook] Ignoring reassignment #${event.issue.number}`
-          );
-          return res.status(200).json({ status: "ignored" });
-        }
-
-        // Check assignee matches bot
-        if (event.issue.assignee.login !== appConfig.botUsername) {
-          logger.info(
-            `[webhook] Ignoring assign #${event.issue.number} — assigned to ${event.issue.assignee.login}`
-          );
-          return res.status(200).json({ status: "ignored", assignee: event.issue.assignee.login });
-        }
-
-        const deliveryId = (req.headers["x-github-delivery"] as string) ?? "";
-        if (queueStore && queueStore.deliveryReceived(deliveryId)) {
-          console.log(`[webhook] Duplicate delivery ${deliveryId}, ignoring`);
-          return res.status(200).json({ status: "ignored", reason: "duplicate" });
-        }
-
-        if (queueStore) {
-          const openJob = queueStore.getOpenJobPerIssue(
-            event.repository.full_name,
-            event.issue.number
-          );
-          if (openJob) {
-            console.log(
-              `[webhook] Issue #${event.issue.number} already has open job ${openJob.id}, ignoring`
-            );
-            return res.status(200).json({ status: "ignored", reason: "already_queued" });
-          }
-          queueStore.enqueue(
-            event.repository.full_name,
-            event.issue.number,
-            { action: event.action, title: event.issue.title }
-          );
-          metrics.recordQueue();
-          return res.status(200).json({ status: "queued" });
-        }
-
-        logger.info(
-          `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
-        );
-
-        // Parse per-repo config and directives
-        const [repoConfigResult, directivesResult] = await Promise.all([
-          loadRepoConfig(
-            appConfig.githubToken,
-            event.repository.full_name,
-            repoConfigCache,
-            REPO_CONFIG_CACHE_TTL_MS
-          ),
-          checkCollaborator(
-            appConfig.githubToken,
-            event.repository.full_name,
-            event.issue.user.login
-          ).then((isCollab) =>
-            parseDirectives(
-              event.issue.title,
-              event.issue.body,
-              isCollab
-            )
-          ),
-        ]);
-
-        event.jobOptions = directivesResult.jobOptions;
-
-        handlers.forEach(async (handler) => {
-          try {
-            await handler(event);
-          } catch (error) {
-            logger.error(
-              `[webhook] Handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
-            );
-          }
+        if (!commentHandler) return res.status(200).json({ status: "ignored", reason: "commands_disabled" });
+        commentHandler(c).catch((error) => {
+          logger.error(`[webhook] Comment handler error for #${c.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
         });
         return res.status(200).json({ status: "accepted" });
       }
 
-      return res.status(200).json({ status: "ignored" });
+      const event = body;
+
+      if (event.issue.state === "closed" || event.issue.pull_request) {
+        return res.status(200).json({ status: "ignored" });
+      }
+
+      // ── Retry: `needs-retry` label added (or present when the issue is edited) ──
+      const retryLabelAdded = event.action === "labeled" && event.label?.name === "needs-retry";
+      const retryOnEdit = event.action === "edited" && event.issue.labels.some((l) => l.name === "needs-retry");
+      if ((retryLabelAdded || retryOnEdit) && retryHandler && !isBotLogin(event.sender.login)) {
+        logger.info(`[webhook] Retry triggered for issue #${event.issue.number} in ${event.repository.full_name}`);
+        retryHandler(event).catch((error) => {
+          logger.error(
+            `[webhook] Retry handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
+          );
+        });
+        return res.status(200).json({ status: "retry", action: event.action });
+      }
+
+      // ── Issue body edited: invalidate a pending plan ──
+      if (event.action === "edited" && event.changes?.body && editHandler) {
+        editHandler(event).catch((error) => {
+          logger.error(`[webhook] Edit handler error for #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
+        });
+        return res.status(200).json({ status: "edited" });
+      }
+
+      if (event.action !== "assigned") {
+        return res.status(200).json({ status: "ignored" });
+      }
+
+      // The payload's top-level `assignee` is the user just assigned (issue.assignee is only the first one)
+      const assignee = event.assignee?.login ?? event.issue.assignee?.login;
+      if (!isBotLogin(assignee)) {
+        logger.info(`[webhook] Ignoring assign #${event.issue.number} — assigned to ${assignee}`);
+        return res.status(200).json({ status: "ignored", assignee });
+      }
+      if (isBotLogin(event.sender.login)) {
+        logger.info(`[webhook] Ignoring self-assignment #${event.issue.number}`);
+        return res.status(200).json({ status: "ignored" });
+      }
+      if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
+        logger.info(`[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`);
+        return res.status(200).json({ status: "ignored" });
+      }
+
+      logger.info(
+        `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
+      );
+
+      try {
+        event.jobOptions = await computeJobOptions(event, appConfig.githubToken);
+      } catch (error) {
+        logger.warn(`[webhook] Could not resolve job options, using defaults: ${redact(error instanceof Error ? error.message : String(error))}`);
+      }
+
+      if (isDispatchReady()) {
+        const r = enqueueIssue(event);
+        if (r.status === "already_queued") {
+          return res.status(200).json({ status: "ignored", reason: "already_queued" });
+        }
+        metrics.recordQueue();
+        if (queuedHandler) {
+          queuedHandler(event).catch(() => {});
+        }
+        return res.status(200).json({ status: "queued" });
+      }
+
+      // No queue configured (tests / minimal setups): run handlers directly
+      handlers.forEach(async (handler) => {
+        try {
+          await handler(event);
+        } catch (error) {
+          logger.error(
+            `[webhook] Handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
+          );
+        }
+      });
+      return res.status(200).json({ status: "accepted" });
     })
   );
 
@@ -390,6 +391,18 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
   // Stats endpoint
   app.get("/api/stats", (_req: Request, res: Response) => {
     res.json(metrics.getSnapshot());
+  });
+
+  // Jobs endpoint (no payloads: they contain issue text)
+  app.get("/api/jobs", (req: Request, res: Response) => {
+    if (!queueStore) return res.json({ jobs: [], queueDepth: 0 });
+    const status = typeof req.query.status === "string" ? req.query.status : undefined;
+    const jobs = queueStore
+      .getSnapshot()
+      .jobs.filter((j) => !status || j.status === status)
+      .slice(-100)
+      .map(({ payload: _payload, ...rest }) => rest);
+    res.json({ jobs, queueDepth: queueStore.getJobCountByStatus().queued });
   });
 
   // Recent activity endpoint

@@ -2,6 +2,13 @@
 // Brief 15: Tests for plan-only / approval flow
 // ---------------------------------------------------------------------------
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import fs from "fs";
+import os from "os";
+import path from "path";
+
+// Keep plan state out of the working tree
+const PLAN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "luci-plans-"));
+vi.mock("../src/config.js", () => ({ getConfig: () => ({ planDataDir: PLAN_DIR }) }));
 import {
   hashIssueBody,
   createPlan,

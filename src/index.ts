@@ -1,8 +1,22 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
 import express from "express";
-import { createWebhookApp, setDockerWorker, onIssue, onRetry, setQueueStore } from "./webhook.js";
-import { handleIssue, retryQueuedIssue } from "./issue-handler.js";
+import {
+  createWebhookApp,
+  setDockerWorker,
+  onIssue,
+  onRetry,
+  onComment,
+  onIssueEdited,
+  onQueued,
+  setQueueStore,
+} from "./webhook.js";
+import { handleIssue, retryQueuedIssue, markIssueQueued, setIssueWorker } from "./issue-handler.js";
+import { handleIssueComment } from "./command-handler.js";
+import { initDispatch, enqueueIssue, eventFromJob, isJobCancelled } from "./dispatch.js";
+import { computeJobOptions } from "./job-context.js";
+import { getPlanState, hashIssueBody, invalidatePlan } from "./plan.js";
+import { GitHubClient } from "./github.js";
 import { getConfig } from "./config.js";
 import { DockerWorker } from "./docker-worker.js";
 import { JsonQueueStore } from "./store.js";
@@ -85,6 +99,9 @@ function stopNgrokTunnels(): void {
   ngrokProcesses = [];
 }
 
+/** `issues` for assignment/retry/edits, `issue_comment` for `/luci` commands. */
+const WEBHOOK_EVENTS = ["issues", "issue_comment"];
+
 async function registerWebhook(ngrokUrl: string, config: ReturnType<typeof getConfig>): Promise<void> {
   const repos = config.monitoredRepos;
   const webhookUrl = `${ngrokUrl}/webhook`;
@@ -105,11 +122,23 @@ async function registerWebhook(ngrokUrl: string, config: ReturnType<typeof getCo
 
       if (existing.ok) {
         const hooks = await existing.json();
-        const exists = (hooks as any[]).some(
-          (h: any) => h.config?.url === webhookUrl && h.events?.includes("issues")
-        );
-        if (exists) {
-          logger.info(`[webhook] Already registered for ${repo}`);
+        const hook = (hooks as any[]).find((h: any) => h.config?.url === webhookUrl);
+        if (hook) {
+          const missing = WEBHOOK_EVENTS.filter((e) => !hook.events?.includes(e));
+          if (missing.length > 0) {
+            await fetch(`https://api.github.com/repos/${repo}/hooks/${hook.id}`, {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${config.githubToken}`,
+                Accept: "application/vnd.github.v3+json",
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ add_events: missing }),
+            });
+            logger.info(`[webhook] Added events ${missing.join(", ")} for ${repo}`);
+          } else {
+            logger.info(`[webhook] Already registered for ${repo}`);
+          }
           continue;
         }
       }
@@ -124,7 +153,7 @@ async function registerWebhook(ngrokUrl: string, config: ReturnType<typeof getCo
         body: JSON.stringify({
           name: "web",
           active: true,
-          events: ["issues"],
+          events: WEBHOOK_EVENTS,
           config: {
             url: webhookUrl,
             secret: config.webhookSecret,
@@ -219,28 +248,54 @@ async function main() {
     port: config.listenPort,
   });
 
-  // Set up durable queue
-  const store = new JsonQueueStore();
-  const queue = new JobQueue(store, config.maxConcurrentWorkers);
-
-  // Recover interrupted jobs from previous run
-  const interrupted = store.recoverInterrupted(config.workerTimeoutMs);
-  if (interrupted.length > 0) {
-    console.log(`[queue] Recovered ${interrupted.length} interrupted job(s)`);
-  }
-
-  // Register issue handler
-  onIssue(handleIssue);
-  onRetry(retryQueuedIssue);
-
-  // Create webhook app
-  const app = createWebhookApp(config);
-  setQueueStore(store);
-
+  // One worker (one semaphore + resource monitor) shared by the whole bot
   const worker = new DockerWorker();
   setDockerWorker(worker);
+  setIssueWorker(worker);
   await worker.ensureImage();
   logger.info("[init] Worker ready");
+
+  // Durable queue: every job (assignment, retry, /luci command) goes through it
+  const store = new JsonQueueStore();
+  const queue = new JobQueue(store, config.maxConcurrentWorkers);
+  queue.setProcessor(async (job) => {
+    const event = eventFromJob(job);
+    if (!event) return { success: false, error: "invalid_job_payload", retryable: false };
+    return handleIssue(event, { isCancelled: () => isJobCancelled(job.id) });
+  });
+  initDispatch(store, queue);
+
+  const recovered = store.recoverInterrupted();
+  if (recovered.length > 0) {
+    logger.info(`[queue] Recovered ${recovered.length} job(s) interrupted by the last shutdown`);
+  }
+
+  onIssue(handleIssue); // only used when no queue is configured
+  onQueued(markIssueQueued);
+  onComment(handleIssueComment);
+  onRetry(async (event) => {
+    event.jobOptions = await computeJobOptions(event, config.githubToken);
+    const r = enqueueIssue(event);
+    if (r.status === "queued") await retryQueuedIssue(event);
+  });
+  onIssueEdited(async (event) => {
+    const [owner, repo] = event.repository.full_name.split("/");
+    const before = getPlanState(owner, repo, event.issue.number);
+    if (!before || before.status !== "pending") return;
+    const after = invalidatePlan(owner, repo, event.issue.number, hashIssueBody(event.issue.body ?? ""));
+    if (after?.status === "expired") {
+      await new GitHubClient({ token: config.githubToken })
+        .createComment(
+          event.repository.full_name,
+          event.issue.number,
+          "📝 The issue changed, so the pending plan is no longer valid. Reply `/luci plan` to re-plan."
+        )
+        .catch(() => {});
+    }
+  });
+
+  const app = createWebhookApp(config);
+  setQueueStore(store);
 
   onShutdown(async () => {
     stopNgrokTunnels();
@@ -268,6 +323,7 @@ async function main() {
     console.log(`[server] Health: http://localhost:${config.listenPort}/health`);
     console.log(`[server] Stats: http://localhost:${config.listenPort}/api/stats`);
     console.log(`[server] Activity: http://localhost:${config.listenPort}/api/activity`);
+    console.log(`[server] Jobs: http://localhost:${config.listenPort}/api/jobs`);
     console.log("=== Bot is ready ===");
     if (ngrokUrl) {
       console.log(`Public URL: ${ngrokUrl}/webhook`);
@@ -278,10 +334,20 @@ async function main() {
     console.log("[queue] Processor started");
   });
 
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info(`[shutdown] ${signal} received`, { signal });
+    setTimeout(() => {
+      logger.error("[shutdown] Forced shutdown after timeout");
+      process.exit(1);
+    }, config.shutdownTimeoutMs).unref();
+
+    server.close();
     stopNgrokTunnels();
-    await queue.stop();
+    // Let running jobs finish; anything still running is re-queued on the next start
+    await queue.stop(Math.max(config.shutdownTimeoutMs - 5_000, 1_000));
     for (const hook of shutdownHooks) {
       try {
         await hook();
@@ -292,15 +358,8 @@ async function main() {
     }
     await worker.stop();
     store.save();
-    server.close(() => {
-      logger.info("[shutdown] Server closed");
-      process.exit(0);
-    });
-
-    setTimeout(() => {
-      logger.error("[shutdown] Forced shutdown after timeout");
-      process.exit(1);
-    }, config.shutdownTimeoutMs);
+    logger.info("[shutdown] Done");
+    process.exit(0);
   };
 
   process.on("SIGINT", () => shutdown("SIGINT"));

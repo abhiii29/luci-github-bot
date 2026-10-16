@@ -1,119 +1,166 @@
-import { GitHubIssueEvent, onIssue } from "./webhook.js";
+import type { GitHubIssueEvent } from "./webhook.js";
 import {
   generateSolution,
   generateSolutionWithDecomposition,
+  generatePlanText,
   isLocalModelTrigger,
   extractLocalPrompt,
+  type CodeGenerationResult,
 } from "./llm.js";
-import { DockerWorker, WorkerProgress } from "./docker-worker.js";
+import { DockerWorker, type WorkerProgress } from "./docker-worker.js";
 import { getConfig } from "./config.js";
 import { metrics } from "./metrics.js";
-import { GitHubClient, buildStatusComment, redact, type StatusCode } from "./github.js";
+import { GitHubClient, buildStatusComment, redact, type StatusCode, type StatusStage } from "./github.js";
 import { buildRepoContext } from "./repo-context.js";
+import { validateSolutionContent } from "./solution-validator.js";
+import { DEFAULT_JOB_OPTIONS, pathsOutsideScope, type ResolvedJobOptions } from "./job-options.js";
+import { createPlan, getApprovedFiles, markPlanExecuted, planKeyFor, type PlanState } from "./plan.js";
+import type { JobOutcome } from "./queue.js";
 
-const worker = new DockerWorker();
-const processingIssues = new Set<string>();
+let worker: DockerWorker | null = null;
 
-// ── GitHub client per-handler factory ────────────────────────────────────
+/** Share the bot's single DockerWorker (one semaphore, one resource monitor). */
+export function setIssueWorker(w: DockerWorker): void {
+  worker = w;
+}
+
+function getWorker(): DockerWorker {
+  if (!worker) worker = new DockerWorker();
+  return worker;
+}
+
+export interface HandleContext {
+  /** Returns true once the job was cancelled (`/luci cancel`); checked before anything is pushed. */
+  isCancelled?: () => boolean;
+}
+
+// ── GitHub helpers (never throw: a failed comment must not fail the job) ──
 
 function makeClient(githubToken: string): GitHubClient {
   return new GitHubClient({ token: githubToken, retries: 2 });
 }
 
-// ── Status label helper ──────────────────────────────────────────────────
-
-async function setStatusLabel(
-  gh: GitHubClient,
-  repo: string,
-  issueNumber: number,
-  status: StatusCode
-): Promise<void> {
+async function setStatusLabel(gh: GitHubClient, repo: string, issueNumber: number, status: StatusCode): Promise<void> {
   try {
     await gh.setLabels(repo, issueNumber, status);
   } catch (err) {
-    const msg = err instanceof Error ? redact(err.message) : String(err);
-    console.warn(`[handler] Failed to set label ${status}: ${msg}`);
+    console.warn(`[handler] Failed to set label ${status}: ${redact(err instanceof Error ? err.message : String(err))}`);
   }
 }
 
-// ── Status comment helper (create once, update in place) ────────────────
+// Status-comment writes for one issue are serialized: two concurrent "find, else create" calls
+// would otherwise both create a comment.
+const statusCommentLocks = new Map<string, Promise<void>>();
 
-async function updateStatusComment(
+function updateStatusComment(
   gh: GitHubClient,
   repo: string,
   issueNumber: number,
-  stage: "queued" | "working" | "pr-opened" | "failed",
-  errorCategory?: string,
-  prUrl?: string,
-  hint?: string
+  stage: StatusStage,
+  extra: { category?: string; prUrl?: string; hint?: string; notes?: string[] } = {}
+): Promise<void> {
+  const key = `${repo}#${issueNumber}`;
+  const prev = statusCommentLocks.get(key) ?? Promise.resolve();
+  const next = prev.then(() => writeStatusComment(gh, repo, issueNumber, stage, extra));
+  statusCommentLocks.set(key, next);
+  void next.finally(() => {
+    if (statusCommentLocks.get(key) === next) statusCommentLocks.delete(key);
+  });
+  return next;
+}
+
+async function writeStatusComment(
+  gh: GitHubClient,
+  repo: string,
+  issueNumber: number,
+  stage: StatusStage,
+  extra: { category?: string; prUrl?: string; hint?: string; notes?: string[] }
 ): Promise<void> {
   try {
+    const body = buildStatusComment(stage, extra.category, extra.prUrl, extra.hint, extra.notes);
     const existing = await gh.findBotComment(repo, issueNumber);
-    const body = buildStatusComment(stage, errorCategory, prUrl, hint);
-    if (existing) {
-      await gh.updateComment(repo, existing.id, body);
-    } else {
-      await gh.createComment(repo, issueNumber, body);
-    }
+    if (existing) await gh.updateComment(repo, existing.id, body);
+    else await gh.createComment(repo, issueNumber, body);
   } catch (err) {
-    const msg = err instanceof Error ? redact(err.message) : String(err);
-    console.warn(`[handler] Failed to update status comment: ${msg}`);
+    console.warn(`[handler] Failed to update status comment: ${redact(err instanceof Error ? err.message : String(err))}`);
   }
 }
 
-// ── Repo file list (moved from Brief 3, kept here for now) ───────────────
-
-async function getRepoFileList(
-  githubToken: string,
-  repoFullName: string
-): Promise<string[]> {
-  const gh = makeClient(githubToken);
+async function postComment(gh: GitHubClient, repo: string, issueNumber: number, body: string): Promise<void> {
   try {
-    const repo = await gh.getRepo(repoFullName);
-    // Use repo-context instead in production; stub here for transition
-    return [];
-  } catch {
-    return [];
+    await gh.createComment(repo, issueNumber, body);
+  } catch (err) {
+    console.warn(`[handler] Failed to post comment: ${redact(err instanceof Error ? err.message : String(err))}`);
   }
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? text.slice(0, max) + "…" : text;
+}
+
+// ── Plan formatting ─────────────────────────────────────────────────────
+
+export function formatPlanComment(state: PlanState): string {
+  const p = state.plan;
+  const lines = [
+    "📝 **Proposed plan** (no code has been written yet)",
+    "",
+    `**Approach:** ${p.approach}`,
+    "",
+    "**Files:**",
+    ...p.files.map((f) => `- \`${f.path}\` (${f.operation}) — ${f.reason}`),
+  ];
+  if (p.risks.length) lines.push("", "**Risks:**", ...p.risks.map((r) => `- ${r}`));
+  if (p.openQuestions.length) lines.push("", "**Open questions:**", ...p.openQuestions.map((q) => `- ${q}`));
+  lines.push(
+    "",
+    "Reply `/luci go` to implement exactly these files, or `/luci cancel` to drop the plan. " +
+      "Editing the issue invalidates the plan. Plans expire after 7 days."
+  );
+  return redact(lines.join("\n"));
 }
 
 // ── retryQueuedIssue ────────────────────────────────────────────────────
 
+/** Prepare an issue for a retry (`needs-retry` label): clear the trigger label, show it as queued. */
 export async function retryQueuedIssue(event: GitHubIssueEvent): Promise<void> {
-  const config = getConfig();
-  const { githubToken } = config;
-  const gh = makeClient(githubToken);
-  const repoFullName = event.repository.full_name;
+  const gh = makeClient(getConfig().githubToken);
+  const repo = event.repository.full_name;
   const issueNumber = event.issue.number;
-
-  // Remove needs-retry correctly (per-label endpoint, ignore 404)
   try {
-    await gh.removeLabel(repoFullName, issueNumber, "needs-retry");
+    await gh.removeLabel(repo, issueNumber, "needs-retry");
   } catch {
-    /* ignore — label may not exist */
+    /* label may not exist */
   }
+  await setStatusLabel(gh, repo, issueNumber, "bot:queued");
+  await updateStatusComment(gh, repo, issueNumber, "queued");
+}
 
-  // Set status to queued
-  await setStatusLabel(gh, repoFullName, issueNumber, "bot:queued");
-  await updateStatusComment(gh, repoFullName, issueNumber, "queued");
-
-  console.log(`[handler] Retrying queued issue ${repoFullName}#${issueNumber}`);
-  await handleIssue(event);
+/** Mark an issue as queued on GitHub (called when a job is enqueued). */
+export async function markIssueQueued(event: GitHubIssueEvent): Promise<void> {
+  const gh = makeClient(getConfig().githubToken);
+  await setStatusLabel(gh, event.repository.full_name, event.issue.number, "bot:queued");
+  await updateStatusComment(gh, event.repository.full_name, event.issue.number, "queued");
 }
 
 // ── handleIssue ─────────────────────────────────────────────────────────
 
-export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
+const processingIssues = new Set<string>();
+
+export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = {}): Promise<JobOutcome> {
   const config = getConfig();
   const { githubToken } = config;
   const gh = makeClient(githubToken);
   const repoFullName = event.repository.full_name;
   const issueNumber = event.issue.number;
   const issueKey = `${repoFullName}#${issueNumber}`;
+  const opts: ResolvedJobOptions = { ...DEFAULT_JOB_OPTIONS, ...((event.jobOptions as Partial<ResolvedJobOptions>) ?? {}) };
+  const notes = [...opts.warnings];
+  const cancelled = () => ctx.isCancelled?.() ?? false;
 
   if (processingIssues.has(issueKey)) {
     console.log(`[handler] Already processing ${issueKey}, skipping`);
-    return;
+    return { success: false, error: "already_processing", retryable: false };
   }
   processingIssues.add(issueKey);
 
@@ -121,143 +168,183 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
   metrics.recordIssueReceived(repoFullName, issueNumber);
   metrics.recordIssueProcessing(repoFullName, issueNumber);
 
-  try {
-    const cap = worker.getCapacity();
+  const fail = async (category: string, hint: string, retryable: boolean, error = category): Promise<JobOutcome> => {
+    await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
+    await updateStatusComment(gh, repoFullName, issueNumber, "failed", { category, hint, notes });
+    metrics.recordIssueFailed(error, Date.now() - startTime, repoFullName, issueNumber);
+    return { success: false, error: category, retryable };
+  };
 
-    if (cap.full) {
-      console.log(`[handler] ${issueKey} rejected — all ${cap.max} slots occupied`);
-      metrics.recordQueue();
-      await setStatusLabel(gh, repoFullName, issueNumber, "bot:queued");
-      await updateStatusComment(gh, repoFullName, issueNumber, "queued");
-      return;
+  try {
+    const w = getWorker();
+    if (w.getCapacity().full) {
+      // The worker semaphore waits for a slot; tell the user why it's slow.
+      await updateStatusComment(gh, repoFullName, issueNumber, "queued", { notes });
     }
 
-    // Transition: bot:queued -> bot:in-progress
     await setStatusLabel(gh, repoFullName, issueNumber, "bot:in-progress");
-    await updateStatusComment(gh, repoFullName, issueNumber, "working");
+    await updateStatusComment(gh, repoFullName, issueNumber, "working", { notes });
 
-    console.log(`[handler] Generating solution for ${issueKey}...`);
+    const body = event.issue.body ?? "";
+    const useLocal = opts.model === "local" || isLocalModelTrigger(event.issue.title, body || undefined);
+    const hintText = opts.fileHints.length > 0 ? `\n\nFiles to focus on: ${opts.fileHints.join(", ")}` : "";
+    const repoContext = await buildRepoContext(githubToken, repoFullName, event.issue.title, body + hintText);
+    console.log(`[handler] ${issueKey}: ${repoContext.fileCount} file(s) of context, model=${useLocal ? "local" : "remote"}`);
 
-    // Build repo context for LLM
-    const repoContext = await buildRepoContext(
-      githubToken,
-      repoFullName,
-      event.issue.title,
-      event.issue.body || ""
-    );
-    console.log(`[handler] Loaded ${repoContext.fileCount} file(s) for context`);
+    // ── Plan stage: post a plan and stop until a collaborator says `/luci go` ──
+    if (opts.planOnly && !opts.approvedPlanFiles) {
+      const { plan } = await createPlan(
+        repoFullName.split("/")[0],
+        event.issue.title,
+        body,
+        repoFullName,
+        issueNumber,
+        () => generatePlanText(event.issue.title, body || "(no description)", repoContext.promptSection, useLocal)
+      );
+      if (plan.plan.files.length === 0) {
+        return await fail("plan_empty", "The model could not produce a usable plan. Add detail to the issue and reply `/luci plan`.", false);
+      }
+      await postComment(gh, repoFullName, issueNumber, formatPlanComment(plan));
+      await setStatusLabel(gh, repoFullName, issueNumber, "bot:awaiting-review");
+      await updateStatusComment(gh, repoFullName, issueNumber, "plan-pending", { notes });
+      return { success: true, noOp: true };
+    }
 
-    // Generate solution: use decomposition pipeline for local model, single-shot for remote
-    const bodyOrNull = event.issue.body;
-    let solution: Awaited<ReturnType<typeof generateSolution>>;
-    const useLocal = isLocalModelTrigger(event.issue.title, bodyOrNull ?? undefined);
-
+    // ── Generate ──
+    const scopeNote = opts.approvedPlanFiles
+      ? `\n\nIMPLEMENT THE APPROVED PLAN. Only these files may change: ${opts.approvedPlanFiles.join(", ")}`
+      : "";
+    let solution: CodeGenerationResult;
     if (useLocal) {
-      const focusedPrompt = extractLocalPrompt(event.issue.title, bodyOrNull ?? undefined);
-      console.log(`[handler] Using local LLM decomposition pipeline (@local-model detected)`);
       solution = await generateSolutionWithDecomposition(
         event.issue.title,
-        focusedPrompt,
+        extractLocalPrompt(event.issue.title, body || undefined) + hintText + scopeNote,
         repoContext.promptSection,
         [],
         githubToken
       );
     } else {
-      console.log(`[handler] Using remote LLM (single-shot)`);
       solution = await generateSolution(
         event.issue.title,
-        event.issue.body || "(no description)",
+        (body || "(no description)") + hintText + scopeNote,
         repoContext.promptSection
       );
     }
-
     metrics.recordLlmGeneration(solution.success, useLocal);
 
     if (!solution.success) {
-      console.error(`[handler] LLM failed: ${solution.error}`);
-      await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
-      await updateStatusComment(
+      if (solution.refused) {
+        return await fail("refused", `The model declined: ${truncate(solution.refused, 300)}`, false);
+      }
+      if (solution.clarification) {
+        return await fail(
+          "needs_clarification",
+          `The model needs more information: ${truncate(solution.clarification, 500)} — update the issue and reply \`/luci retry\`.`,
+          false
+        );
+      }
+      return await fail("llm_generation", "The model's answer could not be used. It will be retried automatically.", true, solution.error);
+    }
+
+    // ── Validate content and scope before anything leaves the bot ──
+    const content = validateSolutionContent(solution.files, undefined, {
+      warnSecrets: true,
+      issueKeywords: `${event.issue.title}\n${body}`,
+    });
+    notes.push(...content.warnings.map((w) => `${w.value}: ${w.reason}`));
+    if (!content.valid) {
+      const reasons = content.errors.map((e) => `${e.value}: ${e.reason}`).join("; ");
+      return await fail("validation", `The generated change was rejected: ${truncate(reasons, 500)}`, false, reasons);
+    }
+    const outOfScope = pathsOutsideScope(solution.files.map((f) => f.path), opts);
+    if (outOfScope.length > 0) {
+      return await fail(
+        "out_of_scope",
+        `The change touched files outside the allowed scope: ${truncate(outOfScope.join(", "), 300)}`,
+        false
+      );
+    }
+
+    // ── Dry run: report, don't push ──
+    if (config.dryRun || opts.dryRun) {
+      await postComment(
         gh,
         repoFullName,
         issueNumber,
-        "failed",
-        "llm_generation",
-        undefined,
-        "Check the issue description and try again. Label \`needs-retry\` to attempt."
-      );
-      return;
-    }
-
-    console.log(`[handler] Solution: ${solution.files.length} file(s), branch ${solution.branchName}`);
-
-    // DRY_RUN: skip container execution, report the solution summary instead
-    if (config.dryRun) {
-      console.log(`[handler] DRY_RUN: skipping container execution for ${issueKey}`);
-      await gh.createComment(
-        repoFullName,
-        issueNumber,
-        `⚠️ **luci-github-bot (DRY RUN)** generated a solution but did not push or create a PR.\n\n\`\`\`\nBranch: ${solution.branchName}\nCommit: ${redact(solution.commitMessage)}\n\nFiles: ${solution.files.map((f) => `${f.operation}: ${f.path}`).join(", ")}\n\`\`\`\n\nTo execute for real, unset \`DRY_RUN\` and restart the bot.`
+        redact(
+          "🧪 **Dry run** — nothing was pushed.\n\n" +
+            `- Branch: \`${solution.branchName}\`\n- Commit: ${solution.commitMessage}\n` +
+            solution.files.map((f) => `- ${f.operation}: \`${f.path}\``).join("\n")
+        )
       );
       await setStatusLabel(gh, repoFullName, issueNumber, "bot:awaiting-review");
-      return;
+      await updateStatusComment(gh, repoFullName, issueNumber, "dry-run", { notes });
+      return { success: true, noOp: true };
     }
 
-    // Execute in worker
-    const result = await worker.processIssue(event, solution, (progress: WorkerProgress) => {
-      console.log(`[handler] ${progress.stage}: ${progress.message}`);
-    });
+    if (cancelled()) {
+      await updateStatusComment(gh, repoFullName, issueNumber, "failed", { category: "cancelled", hint: "Cancelled before anything was pushed." });
+      return { success: false, error: "cancelled", retryable: false };
+    }
 
+    // ── Execute in a container ──
+    const result = await w.processIssue(
+      event,
+      solution,
+      (progress: WorkerProgress) => console.log(`[handler] ${issueKey} ${progress.stage}: ${progress.message}`),
+      {
+        baseBranch: opts.baseBranch || undefined,
+        noPr: opts.noPr,
+        validation: { deniedPatterns: opts.deniedPaths, ...(opts.maxFiles ? { maxFiles: opts.maxFiles } : {}) },
+      }
+    );
     metrics.recordWorkerExecution(result.success);
 
-    if (result.success) {
-      // Check if PR exists on this branch
-      const pr = await gh.getPullRequestForBranch(repoFullName, result.branchName);
-      await setStatusLabel(gh, repoFullName, issueNumber, "bot:awaiting-review");
-      await updateStatusComment(
-        gh,
-        repoFullName,
-        issueNumber,
-        "pr-opened",
-        undefined,
-        pr?.url
-      );
-      metrics.recordIssueCompleted(result.branchName, Date.now() - startTime, repoFullName, issueNumber);
-    } else {
-      console.error(`[handler] Worker failed: ${result.error}`);
+    if (result.status === "no_changes") {
       await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
-      await updateStatusComment(
-        gh,
-        repoFullName,
-        issueNumber,
-        "failed",
-        "worker_execution",
-        undefined,
-        "Container execution failed. Check bot logs and retry."
-      );
-      metrics.recordIssueFailed(result.error, Date.now() - startTime, repoFullName, issueNumber);
+      await updateStatusComment(gh, repoFullName, issueNumber, "no-changes", { notes });
+      return { success: false, noOp: true };
     }
-  } catch (error) {
-    const errorMsg = error instanceof Error ? redact(error.message) : String(error);
-    console.error(`[handler] Unexpected error for ${issueKey}:`, errorMsg);
-    metrics.recordIssueFailed(errorMsg, Date.now() - startTime, repoFullName, issueNumber);
 
-    try {
-      await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
-      await updateStatusComment(
-        gh,
-        repoFullName,
-        issueNumber,
-        "failed",
-        "unexpected",
-        undefined,
-        "An unexpected error occurred. Check bot logs."
-      );
-    } catch {
-      console.error(`[handler] Failed to post error comment for ${issueKey}`);
+    if (!result.success) {
+      const hint = /validation failed/i.test(result.error ?? "")
+        ? truncate(result.error ?? "", 400)
+        : "The container run failed. It will be retried automatically; check the bot logs if it keeps failing.";
+      const retryable = !/validation failed|does not exist/i.test(result.error ?? "");
+      return await fail("worker_execution", hint, retryable, result.error);
     }
+
+    if (opts.approvedPlanFiles) markPlanExecuted(planKeyFor(repoFullName, issueNumber));
+    metrics.recordIssueCompleted(result.branchName, Date.now() - startTime, repoFullName, issueNumber);
+    await setStatusLabel(gh, repoFullName, issueNumber, "bot:awaiting-review");
+
+    if (result.status === "branch_pushed") {
+      await updateStatusComment(gh, repoFullName, issueNumber, "branch-pushed", { hint: result.branchName, notes });
+      return { success: true };
+    }
+
+    let prUrl = result.prUrl;
+    if (!prUrl) {
+      try {
+        prUrl = (await gh.getPullRequestForBranch(repoFullName, result.branchName))?.url;
+      } catch {
+        /* link is a nice-to-have */
+      }
+    }
+    await updateStatusComment(gh, repoFullName, issueNumber, "pr-opened", { prUrl, notes });
+    return { success: true, prUrl };
+  } catch (error) {
+    const errorMsg = redact(error instanceof Error ? error.message : String(error));
+    console.error(`[handler] Unexpected error for ${issueKey}: ${errorMsg}`);
+    return await fail("unexpected", "An unexpected error occurred. It will be retried automatically; check the bot logs.", true, errorMsg);
   } finally {
     processingIssues.delete(issueKey);
   }
+}
+
+/** Approved-plan helper used by `/luci go`. */
+export function approvedFilesFor(repoFullName: string, issueNumber: number): string[] {
+  return getApprovedFiles(planKeyFor(repoFullName, issueNumber)).map((f) => f.path);
 }
 
 export { handleIssue as default };

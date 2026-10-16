@@ -29,6 +29,7 @@ const configSchema = z.object({
   containerPidsLimit: z.coerce.number().optional(),
   apiToken: z.string().optional(),
   // Override for GitHub Enterprise / integration tests (worker container only)
+  planDataDir: z.string().default(".luci-bot-plans"),
   gitBaseUrl: z.string().optional(),
   githubApiUrl: z.string().optional(),
   webhookBodyLimit: z.coerce.number().default(1_048_576), // 1 MB
@@ -114,6 +115,7 @@ export function getConfig(): Config {
     containerCpus: env.CONTAINER_CPUS,
     containerPidsLimit: env.CONTAINER_PIDS_LIMIT,
     apiToken: env.API_TOKEN || undefined,
+    planDataDir: env.PLAN_DATA_DIR || ".luci-bot-plans",
     gitBaseUrl: env.GIT_BASE_URL || undefined,
     githubApiUrl: env.GITHUB_API_URL || undefined,
     webhookBodyLimit: env.WEBHOOK_BODY_LIMIT ?? "1048576",
