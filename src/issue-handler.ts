@@ -190,6 +190,18 @@ export async function handleIssue(event: GitHubIssueEvent): Promise<void> {
 
     console.log(`[handler] Solution: ${solution.files.length} file(s), branch ${solution.branchName}`);
 
+    // DRY_RUN: skip container execution, report the solution summary instead
+    if (config.dryRun) {
+      console.log(`[handler] DRY_RUN: skipping container execution for ${issueKey}`);
+      await gh.createComment(
+        repoFullName,
+        issueNumber,
+        `⚠️ **luci-github-bot (DRY RUN)** generated a solution but did not push or create a PR.\n\n\`\`\`\nBranch: ${solution.branchName}\nCommit: ${redact(solution.commitMessage)}\n\nFiles: ${solution.files.map((f) => `${f.operation}: ${f.path}`).join(", ")}\n\`\`\`\n\nTo execute for real, unset \`DRY_RUN\` and restart the bot.`
+      );
+      await setStatusLabel(gh, repoFullName, issueNumber, "bot:awaiting-review");
+      return;
+    }
+
     // Execute in worker
     const result = await worker.processIssue(event, solution, (progress: WorkerProgress) => {
       console.log(`[handler] ${progress.stage}: ${progress.message}`);
