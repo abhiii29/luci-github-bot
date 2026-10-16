@@ -1,0 +1,31 @@
+# Copy to .github/workflows/luci-bot.yml in each repo the bot should work on.
+# Repo secrets needed: LUCI_BOT_TOKEN, ADESSO_API_KEY. See docs/GITHUB_ACTION.md.
+name: luci-bot
+
+on:
+  issues:
+    types: [assigned, labeled, edited]
+  issue_comment:
+    types: [created]
+
+# One run per issue at a time; later events wait instead of racing the running job
+concurrency:
+  group: luci-bot-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    # Skip runner start-up for events the bot would ignore anyway
+    if: >-
+      !github.event.issue.pull_request && (
+        (github.event_name == 'issues' && (
+          github.event.action == 'assigned' ||
+          (github.event.action == 'labeled' && github.event.label.name == 'needs-retry') ||
+          github.event.action == 'edited')) ||
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/luci')))
+    uses: abhiii29/luci-github-bot/.github/workflows/luci-bot.yml@main
+    with:
+      bot-username: your-bot-login
+    secrets:
+      bot-token: ${{ secrets.LUCI_BOT_TOKEN }}
+      adesso-api-key: ${{ secrets.ADESSO_API_KEY }}

@@ -197,6 +197,153 @@ function authMiddleware(config: ReturnType<typeof getConfig>): express.RequestHa
   };
 }
 
+export interface RouteResult {
+  code: number;
+  body: Record<string, unknown>;
+  /** Work started for this event (handlers run in the background on the server; the Action awaits it). */
+  work?: Promise<unknown>;
+}
+
+/**
+ * Decide what to do with a verified `issues` / `issue_comment` event and start it.
+ * Shared by the webhook server and the GitHub Action entrypoint (`action.ts`).
+ */
+export async function routeEvent(
+  eventType: string,
+  payload: unknown,
+  deliveryId: string | undefined,
+  appConfig: ReturnType<typeof getConfig>
+): Promise<RouteResult> {
+  if (eventType !== "issues" && eventType !== "issue_comment") {
+    logger.info("[webhook] Ignoring event type: " + eventType);
+    return { code: 200, body: { status: "ignored" } };
+  }
+
+  const body = payload;
+  if (!isGitHubIssueEvent(body)) {
+    logger.error("[webhook] Invalid issue event payload");
+    return { code: 400, body: { error: "Invalid payload" } };
+  }
+
+  if (!appConfig.monitoredRepos.includes(body.repository.full_name)) {
+    logger.info(
+      `[webhook] Ignoring issue #${body.issue.number} from unmonitored repo: ${body.repository.full_name}`
+    );
+    return { code: 200, body: { status: "ignored", repo: body.repository.full_name } };
+  }
+
+  // GitHub redelivers on timeouts and manual "Redeliver": process each delivery once
+  if (queueStore && deliveryId && queueStore.deliveryReceived(deliveryId)) {
+    logger.info(`[webhook] Duplicate delivery ${deliveryId}, ignoring`);
+    return { code: 200, body: { status: "ignored", reason: "duplicate" } };
+  }
+
+  const isBotLogin = (login: string | undefined) =>
+    !!login && !!appConfig.botUsername && login.toLowerCase() === appConfig.botUsername.toLowerCase();
+
+  // ── /luci comment commands ──
+  if (eventType === "issue_comment") {
+    const c = body as unknown as GitHubCommentEvent;
+    if (c.action !== "created" || !c.comment || c.issue.pull_request) {
+      return { code: 200, body: { status: "ignored" } };
+    }
+    // Loop prevention is content-based: the bot's own comments never start with /luci and carry its
+    // marker. (A login check would break the common setup where the bot runs as your own account.)
+    const text = c.comment.body ?? "";
+    if (!/^\s*\/luci\b/im.test(text) || text.includes("<!-- luci-bot") || c.comment.user?.type === "Bot") {
+      return { code: 200, body: { status: "ignored" } };
+    }
+    if (!commentHandler) return { code: 200, body: { status: "ignored", reason: "commands_disabled" } };
+    const work = commentHandler(c).catch((error) => {
+      logger.error(`[webhook] Comment handler error for #${c.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
+    });
+    return { code: 200, body: { status: "accepted" }, work };
+  }
+
+  const event = body;
+
+  if (event.issue.state === "closed" || event.issue.pull_request) {
+    return { code: 200, body: { status: "ignored" } };
+  }
+
+  // ── Retry: `needs-retry` label added (or present when the issue is edited) ──
+  const retryLabelAdded = event.action === "labeled" && event.label?.name === "needs-retry";
+  const retryOnEdit = event.action === "edited" && event.issue.labels.some((l) => l.name === "needs-retry");
+  // The bot never adds `needs-retry` itself (it only removes it), so no sender check is needed.
+  if ((retryLabelAdded || retryOnEdit) && retryHandler) {
+    logger.info(`[webhook] Retry triggered for issue #${event.issue.number} in ${event.repository.full_name}`);
+    const work = retryHandler(event).catch((error) => {
+      logger.error(
+        `[webhook] Retry handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
+      );
+    });
+    return { code: 200, body: { status: "retry", action: event.action }, work };
+  }
+
+  // ── Issue body edited: invalidate a pending plan ──
+  if (event.action === "edited" && event.changes?.body && editHandler) {
+    const work = editHandler(event).catch((error) => {
+      logger.error(`[webhook] Edit handler error for #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
+    });
+    return { code: 200, body: { status: "edited" }, work };
+  }
+
+  if (event.action !== "assigned") {
+    return { code: 200, body: { status: "ignored" } };
+  }
+
+  // The payload's top-level `assignee` is the user just assigned (issue.assignee is only the first one)
+  const assignee = event.assignee?.login ?? event.issue.assignee?.login;
+  if (!isBotLogin(assignee)) {
+    logger.info(`[webhook] Ignoring assign #${event.issue.number} — assigned to ${assignee}`);
+    return { code: 200, body: { status: "ignored", assignee } };
+  }
+  // Self-assignment is allowed: the bot never assigns issues, and it may run as your own account.
+  if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
+    logger.info(`[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`);
+    return { code: 200, body: { status: "ignored" } };
+  }
+
+  logger.info(
+    `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
+  );
+
+  try {
+    event.jobOptions = await computeJobOptions(event, appConfig.githubToken);
+  } catch (error) {
+    logger.warn(`[webhook] Could not resolve job options, using defaults: ${redact(error instanceof Error ? error.message : String(error))}`);
+  }
+
+  if (isDispatchReady()) {
+    if (openJobFor(event.repository.full_name, event.issue.number)) {
+      return { code: 200, body: { status: "ignored", reason: "already_queued" } };
+    }
+    // Mark as queued first: enqueueing can start the job immediately, and its status updates
+    // must come after this one.
+    const work = queuedHandler ? queuedHandler(event).catch(() => {}) : undefined;
+    const r = enqueueIssue(event);
+    if (r.status === "already_queued") {
+      return { code: 200, body: { status: "ignored", reason: "already_queued" } };
+    }
+    metrics.recordQueue();
+    return { code: 200, body: { status: "queued" }, work };
+  }
+
+  // No queue configured (tests / minimal setups): run handlers directly
+  const work = Promise.all(
+    handlers.map(async (handler) => {
+      try {
+        await handler(event);
+      } catch (error) {
+        logger.error(
+          `[webhook] Handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
+        );
+      }
+    })
+  );
+  return { code: 200, body: { status: "accepted" }, work };
+}
+
 export function createWebhookApp(config?: ReturnType<typeof getConfig>): express.Express {
   const appConfig = config ?? getConfig();
   const app = express();
@@ -258,132 +405,8 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
         return res.status(200).json({ status: "pong" });
       }
 
-      if (eventType !== "issues" && eventType !== "issue_comment") {
-        logger.info("[webhook] Ignoring event type: " + eventType);
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      const body = req.body as unknown;
-      if (!isGitHubIssueEvent(body)) {
-        logger.error("[webhook] Invalid issue event payload");
-        return res.status(400).json({ error: "Invalid payload" });
-      }
-
-      if (!appConfig.monitoredRepos.includes(body.repository.full_name)) {
-        logger.info(
-          `[webhook] Ignoring issue #${body.issue.number} from unmonitored repo: ${body.repository.full_name}`
-        );
-        return res.status(200).json({ status: "ignored", repo: body.repository.full_name });
-      }
-
-      // GitHub redelivers on timeouts and manual "Redeliver": process each delivery once
-      if (queueStore && deliveryId && queueStore.deliveryReceived(deliveryId)) {
-        logger.info(`[webhook] Duplicate delivery ${deliveryId}, ignoring`);
-        return res.status(200).json({ status: "ignored", reason: "duplicate" });
-      }
-
-      const isBotLogin = (login: string | undefined) =>
-        !!login && !!appConfig.botUsername && login.toLowerCase() === appConfig.botUsername.toLowerCase();
-
-      // ── /luci comment commands ──
-      if (eventType === "issue_comment") {
-        const c = body as unknown as GitHubCommentEvent;
-        if (c.action !== "created" || !c.comment || c.issue.pull_request) {
-          return res.status(200).json({ status: "ignored" });
-        }
-        // Loop prevention is content-based: the bot's own comments never start with /luci and carry its
-        // marker. (A login check would break the common setup where the bot runs as your own account.)
-        const text = c.comment.body ?? "";
-        if (!/^\s*\/luci\b/im.test(text) || text.includes("<!-- luci-bot") || c.comment.user?.type === "Bot") {
-          return res.status(200).json({ status: "ignored" });
-        }
-        if (!commentHandler) return res.status(200).json({ status: "ignored", reason: "commands_disabled" });
-        commentHandler(c).catch((error) => {
-          logger.error(`[webhook] Comment handler error for #${c.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
-        });
-        return res.status(200).json({ status: "accepted" });
-      }
-
-      const event = body;
-
-      if (event.issue.state === "closed" || event.issue.pull_request) {
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      // ── Retry: `needs-retry` label added (or present when the issue is edited) ──
-      const retryLabelAdded = event.action === "labeled" && event.label?.name === "needs-retry";
-      const retryOnEdit = event.action === "edited" && event.issue.labels.some((l) => l.name === "needs-retry");
-      // The bot never adds `needs-retry` itself (it only removes it), so no sender check is needed.
-      if ((retryLabelAdded || retryOnEdit) && retryHandler) {
-        logger.info(`[webhook] Retry triggered for issue #${event.issue.number} in ${event.repository.full_name}`);
-        retryHandler(event).catch((error) => {
-          logger.error(
-            `[webhook] Retry handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
-          );
-        });
-        return res.status(200).json({ status: "retry", action: event.action });
-      }
-
-      // ── Issue body edited: invalidate a pending plan ──
-      if (event.action === "edited" && event.changes?.body && editHandler) {
-        editHandler(event).catch((error) => {
-          logger.error(`[webhook] Edit handler error for #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`);
-        });
-        return res.status(200).json({ status: "edited" });
-      }
-
-      if (event.action !== "assigned") {
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      // The payload's top-level `assignee` is the user just assigned (issue.assignee is only the first one)
-      const assignee = event.assignee?.login ?? event.issue.assignee?.login;
-      if (!isBotLogin(assignee)) {
-        logger.info(`[webhook] Ignoring assign #${event.issue.number} — assigned to ${assignee}`);
-        return res.status(200).json({ status: "ignored", assignee });
-      }
-      // Self-assignment is allowed: the bot never assigns issues, and it may run as your own account.
-      if (event.issue.labels.some((l) => l.name === "bot:no-run")) {
-        logger.info(`[webhook] Ignoring issue #${event.issue.number} (bot:no-run)`);
-        return res.status(200).json({ status: "ignored" });
-      }
-
-      logger.info(
-        `[webhook] Bot assigned issue #${event.issue.number} in ${event.repository.full_name}: ${event.issue.title}`
-      );
-
-      try {
-        event.jobOptions = await computeJobOptions(event, appConfig.githubToken);
-      } catch (error) {
-        logger.warn(`[webhook] Could not resolve job options, using defaults: ${redact(error instanceof Error ? error.message : String(error))}`);
-      }
-
-      if (isDispatchReady()) {
-        if (openJobFor(event.repository.full_name, event.issue.number)) {
-          return res.status(200).json({ status: "ignored", reason: "already_queued" });
-        }
-        // Mark as queued first: enqueueing can start the job immediately, and its status updates
-        // must come after this one.
-        if (queuedHandler) queuedHandler(event).catch(() => {});
-        const r = enqueueIssue(event);
-        if (r.status === "already_queued") {
-          return res.status(200).json({ status: "ignored", reason: "already_queued" });
-        }
-        metrics.recordQueue();
-        return res.status(200).json({ status: "queued" });
-      }
-
-      // No queue configured (tests / minimal setups): run handlers directly
-      handlers.forEach(async (handler) => {
-        try {
-          await handler(event);
-        } catch (error) {
-          logger.error(
-            `[webhook] Handler error for issue #${event.issue.number}: ${redact(error instanceof Error ? error.message : String(error))}`
-          );
-        }
-      });
-      return res.status(200).json({ status: "accepted" });
+      const routed = await routeEvent(eventType, req.body as unknown, deliveryId, appConfig);
+      return res.status(routed.code).json(routed.body);
     })
   );
 

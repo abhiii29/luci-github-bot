@@ -243,6 +243,24 @@ export class JsonQueueStore {
     return interrupted;
   }
 
+  /**
+   * GitHub Action mode: a run always drains its queue before exiting, so any job still open in the
+   * restored state belongs to a run that was cancelled or killed. Fail it instead of re-running it
+   * (cancelling the workflow run is how a running job is stopped in that mode).
+   */
+  abandonOpenJobs(): JobRecord[] {
+    const now = new Date().toISOString();
+    const abandoned = this.store.jobs.filter((j) => j.status === "running" || j.status === "queued");
+    for (const job of abandoned) {
+      job.status = "failed";
+      job.errorCategory = "interrupted";
+      job.completedAt = now;
+      job.updatedAt = now;
+    }
+    if (abandoned.length > 0) saveStore(this.dbPath, this.store);
+    return abandoned;
+  }
+
   // ── Persistence ─────────────────────────────────────────────────────
 
   save(): void {
