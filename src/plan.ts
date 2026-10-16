@@ -1,0 +1,340 @@
+// ---------------------------------------------------------------------------
+// Brief 15: Plan-only / approval flow
+// ---------------------------------------------------------------------------
+// Plan stage: ask LLM for a PLAN (files, approach, risks) without writing code
+// Approval: /luci go starts real generation constrained to plan files
+// Persistence: JSON file keyed by repo#issue, with TTL expiration
+// ---------------------------------------------------------------------------
+
+import fs from "fs";
+import path from "path";
+import { getConfig } from "./config.js";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface PlanFile {
+  path: string;
+  reason: string;
+  operation: "create" | "update" | "delete";
+}
+
+export interface Plan {
+  branchName: string;
+  commitMessage: string;
+  files: PlanFile[];
+  approach: string;
+  risks: string[];
+  openQuestions: string[];
+  createdAt: string;
+  issueBodyHash?: string;
+}
+
+export interface PlanState {
+  plan: Plan;
+  status: "pending" | "approved" | "cancelled" | "expired" | "executed";
+  approvedBy?: string;
+  approvedAt?: string;
+  expiredAt?: string;
+  issueBodyHash?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Persistence (JSON file-based job store)
+// ---------------------------------------------------------------------------
+
+function getPlanDir(): string {
+  try {
+    const config = getConfig();
+    const dataDir = (config as any).planDataDir ?? ".luci-bot-plans";
+    return path.resolve(dataDir);
+  } catch {
+    return path.resolve(".luci-bot-plans");
+  }
+}
+
+function getPlanKey(owner: string, repo: string, issueNumber: number): string {
+  // Sanitize repo name to avoid path separators
+  const safeRepo = repo.replace(/[/:]/g, "-");
+  return `${owner}__${safeRepo}__${issueNumber}`;
+}
+
+function getPlanFilePath(key: string): string {
+  return path.join(getPlanDir(), `${key}.json`);
+}
+
+function readPlanState(key: string): PlanState | null {
+  const filePath = getPlanFilePath(key);
+  try {
+    const raw = fs.readFileSync(filePath, "utf-8");
+    return JSON.parse(raw) as PlanState;
+  } catch {
+    return null;
+  }
+}
+
+function writePlanState(key: string, state: PlanState): void {
+  const dir = getPlanDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(getPlanFilePath(key), JSON.stringify(state, null, 2));
+}
+
+function deletePlanState(key: string): void {
+  try {
+    fs.unlinkSync(getPlanFilePath(key));
+  } catch {
+    // Ignore if file doesn't exist
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TTL / expiration
+// ---------------------------------------------------------------------------
+
+const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+export function isPlanExpired(state: PlanState, ttlMs: number = DEFAULT_TTL_MS): boolean {
+  const created = new Date(state.plan.createdAt).getTime();
+  return Date.now() - created > ttlMs;
+}
+
+// ---------------------------------------------------------------------------
+// Issue body hash
+// ---------------------------------------------------------------------------
+
+function simpleHash(str: string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+// ---------------------------------------------------------------------------
+// Plan generation prompt (coordinating with Brief 12)
+// ---------------------------------------------------------------------------
+
+const PLAN_SYSTEM_PROMPT = `You are an expert software architect. You receive a GitHub issue and must produce a PLAN — not code.
+
+OUTPUT FORMAT:
+
+BRANCH: <branch-name>
+COMMIT: <commit-message>
+APPROACH: <brief description of the technical approach>
+RISK: <risk 1>
+RISK: <risk 2>
+QUESTION: <open question 1>
+QUESTION: <open question 2>
+FILES: <path>:<operation>:<one-line reason>
+FILES: <path>:<operation>:<one-line reason>
+
+RULES:
+- BRANCH and COMMIT on first two lines
+- FILES use colon-separated format: path:operation:reason
+- OPERATION is create, update, or delete
+- List ONLY the files that need to change with a one-line reason
+- Identify risks and open questions
+- Keep approach concise (2-3 sentences)
+- Do NOT write code`;
+
+// ---------------------------------------------------------------------------
+// Top-level functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a plan for an issue. Returns the plan and the state key.
+ */
+export async function createPlan(
+  owner: string,
+  issueTitle: string,
+  issueBody: string,
+  repoFullName: string,
+  issueNumber: number,
+  llmGenerate?: (prompt: string) => Promise<string>,
+): Promise<{ key: string; plan: PlanState }> {
+  const key = getPlanKey(owner, repoFullName, issueNumber);
+
+  // Check if issue body changed since last plan
+  const existing = readPlanState(key);
+  const bodyHash = simpleHash(issueBody ?? "");
+  if (existing && existing.plan.issueBodyHash === bodyHash && existing.status === "pending") {
+    return { key, plan: existing };
+  }
+
+  // Generate plan via LLM
+  const prompt = `${PLAN_SYSTEM_PROMPT}\n\nREPOSITORY: ${repoFullName}\n\nISSUE:\nTitle: ${issueTitle}\nDescription: ${issueBody}`;
+  let rawOutput = "";
+  if (llmGenerate) {
+    rawOutput = await llmGenerate(prompt);
+  } else {
+    // Fallback: generate a simple plan without LLM
+    rawOutput = `BRANCH: plan/${repoFullName.replace("/", "-")}-${issueNumber}\nCOMMIT: Plan for issue #${issueNumber}\nAPPROACH: TBD\nRISK: None\nFILES: TBD:update:TBD`;
+  }
+
+  const plan = parsePlanOutput(rawOutput, issueBody ?? "");
+
+  const state: PlanState = {
+    plan,
+    status: "pending",
+    issueBodyHash: bodyHash,
+  };
+
+  writePlanState(key, state);
+
+  return { key, plan: state };
+}
+
+/**
+ * Approve a plan. Requires collaborator approval.
+ */
+export function approvePlan(
+  key: string,
+  username: string
+): PlanState {
+  const state = readPlanState(key);
+  if (!state) {
+    throw new Error(`No plan found for key: ${key}`);
+  }
+  if (state.status === "cancelled") {
+    throw new Error("Plan is cancelled");
+  }
+  if (state.status === "expired") {
+    throw new Error("Plan is expired");
+  }
+
+  state.status = "approved";
+  state.approvedBy = username;
+  state.approvedAt = new Date().toISOString();
+
+  writePlanState(key, state);
+  return state;
+}
+
+/**
+ * Cancel a plan.
+ */
+export function cancelPlan(key: string): PlanState {
+  const state = readPlanState(key);
+  if (!state) {
+    throw new Error(`No plan found for key: ${key}`);
+  }
+
+  state.status = "cancelled";
+  writePlanState(key, state);
+  return state;
+}
+
+/**
+ * Get plan state, checking expiration.
+ */
+export function getPlanState(
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  ttlMs: number = DEFAULT_TTL_MS
+): PlanState | null {
+  const key = getPlanKey(owner, repo, issueNumber);
+  const state = readPlanState(key);
+  if (!state) return null;
+
+  if (isPlanExpired(state, ttlMs) && state.status === "pending") {
+    state.status = "expired";
+    state.expiredAt = new Date().toISOString();
+    writePlanState(key, state);
+  }
+
+  return state;
+}
+
+/**
+ * Invalidate plan due to issue body change.
+ */
+export function invalidatePlan(
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  newBodyHash: string
+): PlanState | null {
+  const key = getPlanKey(owner, `${owner}/${repo}`, issueNumber);
+  const state = readPlanState(key);
+  if (!state) return null;
+  if (state.plan.issueBodyHash === newBodyHash) return state;
+
+  state.status = "expired";
+  state.expiredAt = new Date().toISOString();
+  writePlanState(key, state);
+  return state;
+}
+
+/**
+ * Get approved plan files for execution.
+ */
+export function getApprovedFiles(key: string): PlanFile[] {
+  const state = readPlanState(key);
+  if (!state || state.status !== "approved") {
+    return [];
+  }
+  return state.plan.files;
+}
+
+// ---------------------------------------------------------------------------
+// Plan parsing
+// ---------------------------------------------------------------------------
+
+export function parsePlanOutput(raw: string, _issueBody: string): Plan {
+  const lines = raw.split("\n").map((l) => l.trim());
+
+  let branchName = "";
+  let commitMessage = "";
+  let approach = "";
+  const risks: string[] = [];
+  const questions: string[] = [];
+  const fileEntries: Array<{ path: string; operation: string; reason: string }> = [];
+
+  for (const line of lines) {
+    if (line.startsWith("BRANCH: ")) {
+      branchName = line.slice(8).trim();
+    } else if (line.startsWith("COMMIT: ")) {
+      commitMessage = line.slice(8).trim();
+    } else if (line.startsWith("APPROACH: ")) {
+      approach = line.slice(10).trim();
+    } else if (line.startsWith("RISK: ")) {
+      risks.push(line.slice(6).trim());
+    } else if (line.startsWith("QUESTION: ")) {
+      questions.push(line.slice(10).trim());
+    } else if (line.startsWith("FILES: ")) {
+      const rest = line.slice(7).trim();
+      // Parse path:operation:reason
+      const parts = rest.split(":");
+      if (parts.length >= 3) {
+        const path_ = parts[0].trim();
+        const op = parts[1].trim() as "create" | "update" | "delete";
+        const reason = parts.slice(2).join(":").trim();
+        if (op === "create" || op === "update" || op === "delete") {
+          fileEntries.push({ path: path_, operation: op, reason });
+        }
+      }
+    }
+  }
+
+  const files: PlanFile[] = fileEntries.map((f) => ({
+    path: f.path,
+    operation: f.operation as "create" | "update" | "delete",
+    reason: f.reason,
+  }));
+
+  return {
+    branchName: branchName || `plan/${approach.slice(0, 30).replace(/\s+/g, "-")}`,
+    commitMessage: commitMessage || "Implement approved plan",
+    files,
+    approach: approach || "TBD",
+    risks,
+    openQuestions: questions,
+    createdAt: new Date().toISOString(),
+  };
+}
