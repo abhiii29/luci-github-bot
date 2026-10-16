@@ -120,11 +120,22 @@ export function formatPlanComment(state: PlanState): string {
   ];
   if (p.risks.length) lines.push("", "**Risks:**", ...p.risks.map((r) => `- ${r}`));
   if (p.openQuestions.length) lines.push("", "**Open questions:**", ...p.openQuestions.map((q) => `- ${q}`));
-  lines.push(
-    "",
-    "Reply `/luci go` to implement exactly these files, or `/luci cancel` to drop the plan. " +
-      "Editing the issue invalidates the plan. Plans expire after 7 days."
-  );
+  if (p.parts && p.parts.length >= 2) {
+    lines.push("", `**Too big for one PR — proposed split into ${p.parts.length} parts:**`);
+    for (const part of p.parts) {
+      lines.push(`- \`${part.title}\` — ${part.scope} (files: ${part.files.join(", ")})`);
+    }
+    lines.push(
+      "",
+      "Reply `/luci go` to create one sub-issue per part (part 1 is started automatically, each next part starts when the previous PR merges), or `/luci cancel`."
+    );
+  } else {
+    lines.push(
+      "",
+      "Reply `/luci go` to implement exactly these files, or `/luci cancel` to drop the plan. " +
+        "Editing the issue invalidates the plan. Plans expire after 7 days."
+    );
+  }
   return redact(lines.join("\n"));
 }
 
@@ -241,7 +252,7 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
         issueNumber,
         () => generatePlanText(event.issue.title, body || "(no description)", repoContext.promptSection, useLocal)
       );
-      if (plan.plan.files.length === 0) {
+      if (plan.plan.files.length === 0 && (!plan.plan.parts || plan.plan.parts.length < 2)) {
         return await fail("plan_empty", "The model could not produce a usable plan. Add detail to the issue and reply `/luci plan`.", false);
       }
       await postComment(gh, repoFullName, issueNumber, formatPlanComment(plan));
