@@ -195,6 +195,7 @@ export async function handleIssue(event: GitHubIssueEvent, ctx: HandleContext = 
   metrics.recordIssueProcessing(repoFullName, issueNumber);
 
   const fail = async (category: string, hint: string, retryable: boolean, error = category): Promise<JobOutcome> => {
+    console.error(`[issue-handler] ${repoFullName}#${issueNumber} failed (${category}): ${error}`);
     await setStatusLabel(gh, repoFullName, issueNumber, "bot:blocked");
     await updateStatusComment(gh, repoFullName, issueNumber, "failed", { category, hint, notes });
     metrics.recordIssueFailed(error, Date.now() - startTime, repoFullName, issueNumber);

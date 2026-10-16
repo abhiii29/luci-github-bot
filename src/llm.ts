@@ -158,7 +158,8 @@ async function adessoChat(
     defaultHeaders: { "anthropic-version": "2023-06-01" },
   });
 
-  const response = await openai.chat.completions.create({
+  // Stream: the gateway drops non-streamed requests that generate for more than ~80s (502).
+  const stream = await openai.chat.completions.create({
     model,
     messages: [
       { role: "system", content: systemPrompt },
@@ -166,9 +167,14 @@ async function adessoChat(
     ],
     max_tokens: maxTokens,
     temperature: 0.2,
+    stream: true,
   });
 
-  return stripThinkingTags(response.choices[0]?.message?.content ?? "");
+  let content = "";
+  for await (const chunk of stream) {
+    content += chunk.choices[0]?.delta?.content ?? "";
+  }
+  return stripThinkingTags(content);
 }
 
 // ---------------------------------------------------------------------------
