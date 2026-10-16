@@ -71,18 +71,20 @@ export interface WorkerCapacity {
 
 // --- Dynamic semaphore: capacity-aware permits ---
 
-class DynamicSemaphore {
-  private available: number;
-  private max: number;
-  private queue: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+export class DynamicSemaphore {
+  private inUse = 0;
+  private limit: number;
+  private readonly max: number;
+  private waiters: Array<() => void> = [];
 
   constructor(max: number) {
     this.max = max;
-    this.available = max;
+    this.limit = max;
   }
 
+  /** Free slots right now (0 when busy or when resource pressure lowered the limit). */
   getAvailable(): number {
-    return this.available;
+    return Math.max(0, this.limit - this.inUse);
   }
 
   getMax(): number {
@@ -90,28 +92,33 @@ class DynamicSemaphore {
   }
 
   async acquire(): Promise<void> {
-    if (this.available > 0) {
-      this.available--;
+    if (this.inUse < this.limit) {
+      this.inUse++;
       return;
     }
-    return new Promise<void>((resolve, reject) => {
-      this.queue.push({ resolve, reject });
-    });
+    // The slot is handed over (inUse already incremented) by wake()
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
   }
 
   release(): void {
-    if (this.queue.length > 0) {
-      const next = this.queue.shift()!;
-      next.resolve();
-    } else {
-      this.available++;
-    }
+    this.inUse = Math.max(0, this.inUse - 1);
+    this.wake();
   }
 
+  /**
+   * Scale the limit with host capacity (0..1). Lowering it never interrupts running work; raising
+   * it again (pressure gone) immediately lets waiting jobs start.
+   */
   adjustByCapacity(capacity: number): void {
-    const target = Math.max(0, Math.round(capacity * this.max));
-    if (target < this.available) {
-      this.available = target;
+    this.limit = Math.min(this.max, Math.max(0, Math.round(capacity * this.max)));
+    this.wake();
+  }
+
+  private wake(): void {
+    while (this.waiters.length > 0 && this.inUse < this.limit) {
+      const next = this.waiters.shift()!;
+      this.inUse++; // reserve synchronously so a burst of wakes can't over-admit
+      next();
     }
   }
 }

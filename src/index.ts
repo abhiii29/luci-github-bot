@@ -1,4 +1,5 @@
-import { execFile } from "child_process";
+import { execFile, execFileSync } from "child_process";
+import fs from "fs";
 import { promisify } from "util";
 import express from "express";
 import {
@@ -188,7 +189,7 @@ function validateStartup(config: ReturnType<typeof getConfig>): string[] {
 
   const apiKeyPath = config.adassoApiKeyFile.replace(/^~($|\/)/, process.env.HOME + "/");
   try {
-    require("fs").accessSync(apiKeyPath, require("fs").constants.R_OK);
+    fs.accessSync(apiKeyPath, fs.constants.R_OK);
   } catch {
     problems.push(`API key file not readable: ${config.adassoApiKeyFile}`);
   }
@@ -205,12 +206,10 @@ function validateStartup(config: ReturnType<typeof getConfig>): string[] {
 
   const hasNgrok = !!(config.ngrokAuthToken && config.ngrokAuthToken.length > 10);
   if (hasNgrok) {
-    const ngrokBin = require("child_process").execFileSync("which", ["ngrok"], {
-      timeout: 5000,
-      stdio: ["pipe", "pipe", "ignore"],
-    }).toString().trim();
-    if (!ngrokBin) {
-      problems.push("ngrok binary: not found in PATH (tunnel will not start automatically)");
+    try {
+      execFileSync("which", ["ngrok"], { timeout: 5000, stdio: ["pipe", "pipe", "ignore"] });
+    } catch {
+      problems.push("ngrok binary: not found in PATH (unset NGROK_AUTHTOKEN or install ngrok)");
     }
   }
 

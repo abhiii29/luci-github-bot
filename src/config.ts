@@ -100,7 +100,7 @@ export function getConfig(): Config {
     webhookSecret: env.WEBHOOK_SECRET ?? "",
     monitoredRepos: env.MONITORED_REPOS ?? "luci/luci-bot",
     workerTimeoutMs: env.WORKER_TIMEOUT_MS ?? "600000",
-    maxConcurrentWorkers: env.MAX_CONCURRENT_WORKERS ?? "3",
+    maxConcurrentWorkers: env.MAX_CONCURRENT_WORKERS ?? "1",
     containerRuntime: (env.CONTAINER_RUNTIME as "docker" | "podman") ?? "podman",
     ollamaBaseUrl: env.OLLAMA_BASE_URL ?? "http://localhost:11434",
     ollamaModel: env.OLLAMA_MODEL ?? "qwen3:8b",
