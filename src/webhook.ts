@@ -16,6 +16,8 @@ import type { GitHubCommentEvent } from "./command-handler.js";
 import type { ResolvedJobOptions } from "./job-options.js";
 import { logger } from "./logger.js";
 import { redact } from "./redact.js";
+import { GitHubClient } from "./github.js";
+import { handleMergedPr, type MergedPr } from "./merge-handler.js";
 
 let dockerWorker: DockerWorker | null = null;
 type RetryHandler = (event: GitHubIssueEvent) => Promise<void>;
@@ -214,6 +216,18 @@ export async function routeEvent(
   deliveryId: string | undefined,
   appConfig: ReturnType<typeof getConfig>
 ): Promise<RouteResult> {
+  // ── Merged bot PR: advance a split to its next part ──
+  if (eventType === "pull_request") {
+    const e = payload as { action?: string; pull_request?: MergedPr; repository?: { full_name: string } };
+    const repo = e.repository?.full_name;
+    if (e.action !== "closed" || !e.pull_request || !repo || !appConfig.monitoredRepos.includes(repo)) {
+      return { code: 200, body: { status: "ignored" } };
+    }
+    const gh = new GitHubClient({ token: appConfig.githubToken, retries: 2 });
+    const outcome = await handleMergedPr(gh, repo, e.pull_request, appConfig.botUsername ?? "");
+    return { code: 200, body: { status: "pull_request", ...outcome } };
+  }
+
   if (eventType !== "issues" && eventType !== "issue_comment") {
     logger.info("[webhook] Ignoring event type: " + eventType);
     return { code: 200, body: { status: "ignored" } };
