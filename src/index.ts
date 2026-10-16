@@ -85,7 +85,7 @@ function stopNgrokTunnels(): void {
 }
 
 /** `issues` for assignment/retry/edits, `issue_comment` for `/luci` commands. */
-const WEBHOOK_EVENTS = ["issues", "issue_comment"];
+const WEBHOOK_EVENTS = ["issues", "issue_comment", "pull_request"];
 
 async function registerWebhook(ngrokUrl: string, config: ReturnType<typeof getConfig>): Promise<void> {
   const repos = config.monitoredRepos;
