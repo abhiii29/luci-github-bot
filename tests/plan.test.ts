@@ -1,8 +1,9 @@
 // ---------------------------------------------------------------------------
 // Brief 15: Tests for plan-only / approval flow
 // ---------------------------------------------------------------------------
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
+  hashIssueBody,
   createPlan,
   approvePlan,
   cancelPlan,
@@ -18,7 +19,7 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const fakeLlm = async (_prompt: string) => `BRANCH: feat/issue-42
+const fakeLlm = async () => `BRANCH: feat/issue-42
 COMMIT: Add rate limiting
 APPROACH: Add a sliding window rate limiter to the webhook handler
 RISK: In-memory state lost on restart
@@ -105,13 +106,21 @@ describe("Plan lifecycle", () => {
   it("expired plan cannot be approved", async () => {
     await createPlan("test-owner", "Add feature", "Body", "test-owner/test-repo", 42, fakeLlm);
     const state = getPlanState("test-owner", "test-repo", 42);
-    if (state) {
-      // Simulate expiration by setting created time in the past
-      state.plan.createdAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
-      // Re-read to trigger expiration
-      const refreshed = getPlanState("test-owner", "test-repo", 42, 1000);
-      expect(refreshed?.status).toBe("expired");
+    expect(state?.status).toBe("pending");
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 8 * 24 * 60 * 60 * 1000);
+      expect(getPlanState("test-owner", "test-repo", 42)?.status).toBe("expired");
+      expect(() => approvePlan(key, "alice")).toThrow("expired");
+    } finally {
+      vi.useRealTimers();
     }
+  });
+
+  it("unchanged issue body does not invalidate the plan", async () => {
+    await createPlan("test-owner", "Add feature", "Same body", "test-owner/test-repo", 42, fakeLlm);
+    const same = invalidatePlan("test-owner", "test-repo", 42, hashIssueBody("Same body"));
+    expect(same?.status).toBe("pending");
   });
 
   it("invalidates plan on issue body change", async () => {

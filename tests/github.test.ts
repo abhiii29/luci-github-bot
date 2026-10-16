@@ -66,7 +66,7 @@ describe("buildStatusComment", () => {
   it("working stage text", () => {
     const text = buildStatusComment("working");
     expect(text).toContain("Working");
-    expect(text).toContain("LLM is generating");
+    expect(text).toContain("generating a solution");
   });
 
   it("pr-opened includes link", () => {

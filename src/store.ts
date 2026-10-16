@@ -219,19 +219,25 @@ export class JsonQueueStore {
 
   // ── Startup recovery ────────────────────────────────────────────────
 
-  recoverInterrupted(timeoutMs: number = 300_000): JobRecord[] {
-    const now = new Date();
+  /**
+   * Called once at startup: any job still marked `running` was orphaned by the previous process.
+   * Re-queue it if it has attempts left, otherwise fail it as `interrupted`.
+   */
+  recoverInterrupted(_timeoutMs?: number): JobRecord[] {
+    const now = new Date().toISOString();
     const interrupted: JobRecord[] = [];
     for (const job of this.store.jobs) {
       if (job.status !== "running") continue;
-      const started = job.startedAt ? new Date(job.startedAt).getTime() : 0;
-      if (now.getTime() - started > timeoutMs) {
+      if (job.attempts < job.maxAttempts) {
+        job.status = "queued";
+        job.startedAt = undefined;
+      } else {
         job.status = "failed";
         job.errorCategory = "interrupted";
-        job.completedAt = now.toISOString();
-        job.updatedAt = now.toISOString();
-        interrupted.push(job);
+        job.completedAt = now;
       }
+      job.updatedAt = now;
+      interrupted.push(job);
     }
     if (interrupted.length > 0) saveStore(this.dbPath, this.store);
     return interrupted;

@@ -1,7 +1,17 @@
 import { JsonQueueStore, JobRecord, JobStatus } from "./store.js";
 import { getConfig } from "./config.js";
 
-export type JobProcessor = (job: JobRecord) => Promise<{ success: boolean; prUrl?: string; error?: string }>;
+export interface JobOutcome {
+  success: boolean;
+  prUrl?: string;
+  error?: string;
+  /** Finished without changes (e.g. nothing to commit, plan posted). Recorded as no_op. */
+  noOp?: boolean;
+  /** false = do not retry (bad input, refusal, validation). Default: retry until maxAttempts. */
+  retryable?: boolean;
+}
+
+export type JobProcessor = (job: JobRecord) => Promise<JobOutcome>;
 
 export class JobQueue {
   private store: JsonQueueStore;
@@ -21,23 +31,35 @@ export class JobQueue {
 
   async start(): Promise<void> {
     this.running = true;
-    this.processNext();
+    this.kick();
   }
 
-  async stop(): Promise<void> {
+  /** Start as many queued jobs as there are free slots. */
+  kick(): void {
+    const free = this.maxConcurrent - this.runningJobs.size;
+    for (let i = 0; i < free; i++) void this.processNext();
+  }
+
+  /** Stop taking new jobs and wait (up to timeoutMs) for running ones to finish. */
+  async stop(timeoutMs = 60_000): Promise<void> {
     this.running = false;
-    // Wait for running jobs to finish with a timeout
+    const deadline = Date.now() + timeoutMs;
+    while (this.runningJobs.size > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
     if (this.runningJobs.size > 0) {
-      const timeout = setTimeout(() => {
-        console.log("[queue] Shutdown timeout reached, stopping jobs");
-      }, 60_000);
-      // Don't block — jobs will complete naturally
-      clearTimeout(timeout);
+      console.log(`[queue] Shutdown timeout reached with ${this.runningJobs.size} job(s) still running`);
     }
   }
 
+  isIdle(): boolean {
+    return this.runningJobs.size === 0 && this.getQueueDepth() === 0;
+  }
+
   enqueue(repo: string, issueNumber: number, payload: Record<string, unknown>): string {
-    return this.store.enqueueJob(repo, issueNumber, payload).id;
+    const id = this.store.enqueueJob(repo, issueNumber, payload).id;
+    this.kick();
+    return id;
   }
 
   async processNext(): Promise<void> {
@@ -54,18 +76,27 @@ export class JobQueue {
       console.log(`[queue] Processing job ${job.id} for ${job.repo}#${job.issueNumber}`);
       const result = await this.processor(job);
 
-      if (result.success) {
+      const current = this.store.getJob(job.id);
+      if (current?.status === "cancelled") {
+        console.log(`[queue] Job ${job.id} was cancelled while running`);
+      } else if (result.noOp) {
+        this.store.noOpJob(job.id);
+        console.log(`[queue] Job ${job.id} finished without changes`);
+      } else if (result.success) {
         this.store.completeJob(job.id, result.prUrl);
         console.log(`[queue] Job ${job.id} succeeded`);
+      } else if (result.retryable === false) {
+        this.store.failJob(job.id, result.error ?? "failed");
+        console.log(`[queue] Job ${job.id} failed (not retryable): ${result.error}`);
       } else {
-        this.handleJobFailure(job, result.error ?? "unknown_error");
+        this.handleJobFailure(this.store.getJob(job.id) ?? job, result.error ?? "unknown_error");
       }
     } catch (error) {
       this.handleJobFailure(job, error instanceof Error ? error.message : String(error));
     } finally {
       this.runningJobs.delete(job.id);
       // Process next in the queue
-      setImmediate(() => this.processNext());
+      setImmediate(() => this.kick());
     }
   }
 
@@ -75,8 +106,9 @@ export class JobQueue {
       const delay = Math.min(1000 * Math.pow(2, job.attempts - 1), 30_000);
       console.log(`[queue] Job ${job.id} failed (attempt ${job.attempts}/${job.maxAttempts}), retrying in ${delay}ms`);
       setTimeout(() => {
+        if (this.store.getJob(job.id)?.status === "cancelled") return;
         this.store.requeueJob(job.id);
-        this.processNext();
+        this.kick();
       }, delay);
     } else {
       this.store.failJob(job.id, "exceeded_max_attempts");

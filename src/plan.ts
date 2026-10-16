@@ -105,7 +105,7 @@ export function isPlanExpired(state: PlanState, ttlMs: number = DEFAULT_TTL_MS):
 // Issue body hash
 // ---------------------------------------------------------------------------
 
-function simpleHash(str: string): string {
+export function hashIssueBody(str: string): string {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     const char = str.charCodeAt(i);
@@ -114,33 +114,6 @@ function simpleHash(str: string): string {
   }
   return Math.abs(hash).toString(36);
 }
-
-// ---------------------------------------------------------------------------
-// Plan generation prompt (coordinating with Brief 12)
-// ---------------------------------------------------------------------------
-
-const PLAN_SYSTEM_PROMPT = `You are an expert software architect. You receive a GitHub issue and must produce a PLAN — not code.
-
-OUTPUT FORMAT:
-
-BRANCH: <branch-name>
-COMMIT: <commit-message>
-APPROACH: <brief description of the technical approach>
-RISK: <risk 1>
-RISK: <risk 2>
-QUESTION: <open question 1>
-QUESTION: <open question 2>
-FILES: <path>:<operation>:<one-line reason>
-FILES: <path>:<operation>:<one-line reason>
-
-RULES:
-- BRANCH and COMMIT on first two lines
-- FILES use colon-separated format: path:operation:reason
-- OPERATION is create, update, or delete
-- List ONLY the files that need to change with a one-line reason
-- Identify risks and open questions
-- Keep approach concise (2-3 sentences)
-- Do NOT write code`;
 
 // ---------------------------------------------------------------------------
 // Top-level functions
@@ -155,27 +128,19 @@ export async function createPlan(
   issueBody: string,
   repoFullName: string,
   issueNumber: number,
-  llmGenerate?: (prompt: string) => Promise<string>,
+  /** Produces the raw plan text. Builds its own fenced prompt (see prompts.buildPlanPrompt). */
+  llmGenerate: () => Promise<string>,
 ): Promise<{ key: string; plan: PlanState }> {
   const key = getPlanKey(owner, repoFullName, issueNumber);
 
   // Check if issue body changed since last plan
   const existing = readPlanState(key);
-  const bodyHash = simpleHash(issueBody ?? "");
+  const bodyHash = hashIssueBody(issueBody ?? "");
   if (existing && existing.plan.issueBodyHash === bodyHash && existing.status === "pending") {
     return { key, plan: existing };
   }
 
-  // Generate plan via LLM
-  const prompt = `${PLAN_SYSTEM_PROMPT}\n\nREPOSITORY: ${repoFullName}\n\nISSUE:\nTitle: ${issueTitle}\nDescription: ${issueBody}`;
-  let rawOutput = "";
-  if (llmGenerate) {
-    rawOutput = await llmGenerate(prompt);
-  } else {
-    // Fallback: generate a simple plan without LLM
-    rawOutput = `BRANCH: plan/${repoFullName.replace("/", "-")}-${issueNumber}\nCOMMIT: Plan for issue #${issueNumber}\nAPPROACH: TBD\nRISK: None\nFILES: TBD:update:TBD`;
-  }
-
+  const rawOutput = await llmGenerate();
   const plan = parsePlanOutput(rawOutput, issueBody ?? "");
 
   const state: PlanState = {
@@ -192,6 +157,19 @@ export async function createPlan(
 /**
  * Approve a plan. Requires collaborator approval.
  */
+/** Mark an approved plan as executed so it cannot be run twice. */
+export function markPlanExecuted(key: string): void {
+  const state = readPlanState(key);
+  if (!state) return;
+  state.status = "executed";
+  writePlanState(key, state);
+}
+
+/** Stable key for a repo/issue pair ("owner/repo", n). */
+export function planKeyFor(repoFullName: string, issueNumber: number): string {
+  return getPlanKey(repoFullName.split("/")[0], repoFullName, issueNumber);
+}
+
 export function approvePlan(
   key: string,
   username: string
@@ -203,8 +181,11 @@ export function approvePlan(
   if (state.status === "cancelled") {
     throw new Error("Plan is cancelled");
   }
-  if (state.status === "expired") {
+  if (state.status === "expired" || isPlanExpired(state)) {
     throw new Error("Plan is expired");
+  }
+  if (state.status === "executed") {
+    throw new Error("Plan was already executed");
   }
 
   state.status = "approved";
@@ -238,7 +219,7 @@ export function getPlanState(
   issueNumber: number,
   ttlMs: number = DEFAULT_TTL_MS
 ): PlanState | null {
-  const key = getPlanKey(owner, repo, issueNumber);
+  const key = getPlanKey(owner, `${owner}/${repo}`, issueNumber);
   const state = readPlanState(key);
   if (!state) return null;
 
@@ -263,7 +244,8 @@ export function invalidatePlan(
   const key = getPlanKey(owner, `${owner}/${repo}`, issueNumber);
   const state = readPlanState(key);
   if (!state) return null;
-  if (state.plan.issueBodyHash === newBodyHash) return state;
+  if ((state.issueBodyHash ?? state.plan.issueBodyHash) === newBodyHash) return state;
+  if (state.status !== "pending" && state.status !== "approved") return state;
 
   state.status = "expired";
   state.expiredAt = new Date().toISOString();

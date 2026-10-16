@@ -1,3 +1,4 @@
+import { globToRegExp } from "./job-options.js";
 export interface SolutionValidationError {
   field: string;
   value: string;
@@ -20,7 +21,7 @@ export interface ValidationReport {
   warnings: SolutionValidationError[];
 }
 
-const DEFAULT_OPTIONS: Required<ValidateSolutionOptions> = {
+export const DEFAULT_VALIDATION_OPTIONS: Required<ValidateSolutionOptions> = {
   maxFiles: 20,
   maxTotalBytes: 1_048_576, // 1 MB
   deniedPatterns: [
@@ -58,7 +59,8 @@ function matchesPattern(path: string, pattern: string): boolean {
 
 function isDenied(path: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
-    if (matchesPattern(path, pattern)) return true;
+    // matchesPattern keeps the original single-segment semantics; globToRegExp adds proper `**` support
+    if (matchesPattern(path, pattern) || globToRegExp(pattern).test(path)) return true;
   }
   return false;
 }
@@ -73,7 +75,7 @@ function normalizePath(raw: string): string {
   return p;
 }
 
-function validatePath(path: string): SolutionValidationError | null {
+function validatePath(path: string, deniedPatterns: string[] = DEFAULT_VALIDATION_OPTIONS.deniedPatterns): SolutionValidationError | null {
   if (!path) return { field: "path", value: "(empty)", reason: "file path is empty" };
 
   if (path.startsWith("/")) {
@@ -109,7 +111,7 @@ function validatePath(path: string): SolutionValidationError | null {
   }
 
   // Check denied patterns
-  if (isDenied(p, DEFAULT_OPTIONS.deniedPatterns)) {
+  if (isDenied(p, deniedPatterns)) {
     return { field: "path", value: path, reason: "path matches denied pattern" };
   }
 
@@ -153,7 +155,13 @@ export function validateSolution(
   files: Array<{ path: string; content: string; operation: string }>,
   opts?: ValidateSolutionOptions
 ): { valid: true; errors: []; warnings: [] } | { valid: false; errors: SolutionValidationError[] } {
-  const options = { ...DEFAULT_OPTIONS, ...opts };
+  // Repo/job options can only tighten the defaults: extra deny rules, lower limits.
+  const options = {
+    ...DEFAULT_VALIDATION_OPTIONS,
+    deniedPatterns: [...DEFAULT_VALIDATION_OPTIONS.deniedPatterns, ...(opts?.deniedPatterns ?? [])],
+    maxFiles: Math.min(DEFAULT_VALIDATION_OPTIONS.maxFiles, opts?.maxFiles ?? Infinity),
+    maxTotalBytes: Math.min(DEFAULT_VALIDATION_OPTIONS.maxTotalBytes, opts?.maxTotalBytes ?? Infinity),
+  };
   const errors: SolutionValidationError[] = [];
 
   const branchErr = validateBranchName(branchName);
@@ -189,7 +197,7 @@ export function validateSolution(
     seenPaths.add(file.path);
 
     // Validate path
-    const pathErr = validatePath(file.path);
+    const pathErr = validatePath(file.path, options.deniedPatterns);
     if (pathErr) errors.push(pathErr);
 
     // Track byte size
@@ -278,7 +286,7 @@ export function validateSolutionContent(
   currentContents?: Record<string, string>,
   opts?: Partial<ValidateSolutionOptions>
 ): ValidationReport {
-  const options = { ...DEFAULT_OPTIONS, ...opts };
+  const options = { ...DEFAULT_VALIDATION_OPTIONS, ...opts };
   const errors: SolutionValidationError[] = [];
   const warnings: SolutionValidationError[] = [];
 

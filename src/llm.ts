@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { getConfig, getAdessoApiKey } from "./config.js";
 import {
   buildSingleShotPrompt,
+  buildPlanPrompt,
   buildDecompositionPrompt,
   buildExecutionPrompt,
   buildRepairPrompt,
@@ -19,6 +20,10 @@ export interface CodeGenerationResult {
   branchName: string;
   commitMessage: string;
   error?: string;
+  /** The model declined (REFUSE: ...). Not retryable. */
+  refused?: string;
+  /** The model asked for more information (NEEDS_CLARIFICATION: ...). Not retryable. */
+  clarification?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +167,7 @@ async function adessoChat(
     temperature: 0.2,
   });
 
-  return response.choices[0]?.message?.content ?? "";
+  return stripThinkingTags(response.choices[0]?.message?.content ?? "");
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +249,26 @@ export async function generateSolution(
   );
 
   return parseLLMResponse(response);
+}
+
+/**
+ * Ask the model for a change PLAN (no code). Used by the plan-only / approval flow.
+ */
+export async function generatePlanText(
+  issueTitle: string,
+  issueBody: string,
+  repoContext: string,
+  useLocal: boolean
+): Promise<string> {
+  const config = getConfig();
+  const prompt = buildPlanPrompt(issueTitle, issueBody, repoContext);
+  if (useLocal) {
+    return stripMarkdownFences(
+      await ollamaChat(config.ollamaBaseUrl, config.ollamaModel, prompt.system, prompt.user, 3000, config.ollamaDecompositionTimeoutMs)
+    );
+  }
+  const apiKey = await getAdessoApiKey();
+  return adessoChat(apiKey, config.adassoBaseUrl, config.adassoModel, prompt.system, prompt.user, 3000);
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +591,18 @@ export function parseLLMResponse(content: string): CodeGenerationResult {
     .map((line) => line.replace(/\r$/, ""))
     .join("\n");
 
+  const refuseMatch = content.match(/^REFUSE:\s*(.+)$/m);
+  if (refuseMatch && !/^FILE_START:/m.test(content)) {
+    return {
+      success: false,
+      files: [],
+      branchName: "",
+      commitMessage: "",
+      error: `Model refused: ${refuseMatch[1].trim()}`,
+      refused: refuseMatch[1].trim(),
+    };
+  }
+
   const clarificationMatch = content.match(/^NEEDS_CLARIFICATION:\s*(.+)$/m);
   if (clarificationMatch) {
     return {
@@ -574,6 +611,7 @@ export function parseLLMResponse(content: string): CodeGenerationResult {
       branchName: "",
       commitMessage: "",
       error: clarificationMatch[1].trim(),
+      clarification: clarificationMatch[1].trim(),
     };
   }
 

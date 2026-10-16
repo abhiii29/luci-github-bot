@@ -140,31 +140,39 @@ describe("JsonQueueStore", () => {
   });
 
   describe("recoverInterrupted", () => {
-    it("recovers jobs stuck running beyond timeout", () => {
+    it("re-queues a job orphaned mid-run when it has attempts left", () => {
       const db = mkDb("recover-1");
       const store = new JsonQueueStore(db, 86400000);
       const jobId = store.enqueue("a/b", 1, {});
-      store.startJob(jobId);
+      store.startJob(jobId); // attempt 1 of 2
 
-      // Backdate startedAt directly in file
-      const raw = JSON.parse(fs.readFileSync(db, "utf-8"));
-      raw.jobs[0].startedAt = new Date(Date.now() - 600_000).toISOString();
-      fs.writeFileSync(db, JSON.stringify(raw, null, 2));
+      const store2 = new JsonQueueStore(db, 86400000); // simulated restart
+      const recovered = store2.recoverInterrupted();
+      expect(recovered.length).toBe(1);
+      expect(store2.getJob(jobId)?.status).toBe("queued");
+    });
+
+    it("fails an orphaned job that has used all attempts", () => {
+      const db = mkDb("recover-2");
+      const store = new JsonQueueStore(db, 86400000);
+      const jobId = store.enqueue("a/b", 1, {});
+      store.startJob(jobId);
+      store.requeueJob(jobId);
+      store.startJob(jobId); // attempt 2 of 2
 
       const store2 = new JsonQueueStore(db, 86400000);
-      const recovered = store2.recoverInterrupted(300_000);
-      expect(recovered.length).toBe(1);
+      store2.recoverInterrupted();
       expect(store2.getJob(jobId)?.status).toBe("failed");
       expect(store2.getJob(jobId)?.errorCategory).toBe("interrupted");
     });
 
-    it("does not recover jobs within timeout", () => {
-      const store = new JsonQueueStore(mkDb("recover-2"), 86400000);
+    it("leaves queued and finished jobs alone", () => {
+      const store = new JsonQueueStore(mkDb("recover-3"), 86400000);
       store.enqueue("a/b", 1, {});
-      const jobId = store.enqueue("a/b", 2, {});
-      store.startJob(jobId);
-      const recovered = store.recoverInterrupted(300_000);
-      expect(recovered.length).toBe(0);
+      const done = store.enqueue("a/b", 2, {});
+      store.startJob(done);
+      store.completeJob(done);
+      expect(store.recoverInterrupted().length).toBe(0);
     });
   });
 

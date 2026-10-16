@@ -1,3 +1,4 @@
+import { redact as redactCore } from "./redact.js";
 const STATUS_LABELS = ["bot:queued", "bot:in-progress", "bot:awaiting-review", "bot:blocked"] as const;
 export const BOT_COMMENT_MARKER = "<!-- luci-bot:status -->";
 
@@ -19,12 +20,16 @@ export type StatusCode = (typeof STATUS_LABELS)[number];
 // ── Redaction ─────────────────────────────────────────────────────────────
 
 export function redact(text: string): string {
-  return text
-    .replace(/ghp_[A-Za-z0-9]{30,45}/g, "ghp_***")
-    .replace(/github_pat_[A-Za-z0-9_]{20,60}_[A-Za-z0-9_]{20,60}/g, "github_pat_***")
-    .replace(/(https?:\/\/)[^:]+:([^@]+)@/g, "$1***:***@")
-    .replace(/(token=)[^&]+/g, "$1***")
-    .replace(/(Authorization:\s*)Bearer .+/g, "$1Bearer ***");
+  // GitHub-specific forms first (keeps the readable `ghp_***` / `github_pat_***` markers),
+  // then the shared patterns from redact.ts (gho_/ghs_/bearer/configured secrets).
+  return redactCore(
+    text
+      .replace(/ghp_[A-Za-z0-9]{30,45}/g, "ghp_***")
+      .replace(/github_pat_[A-Za-z0-9_]{20,60}_[A-Za-z0-9_]{20,60}/g, "github_pat_***")
+      .replace(/(https?:\/\/)[^:/\s]+:([^@\s]+)@/g, "$1***:***@")
+      .replace(/(token=)[^&\s]+/g, "$1***")
+      .replace(/(Authorization:\s*)Bearer .+/g, "$1Bearer ***")
+  );
 }
 
 export function redactError(msg: string): string {
@@ -260,26 +265,57 @@ async function safeBody(res: Response): Promise<string> {
 
 // ── Status comment builder ────────────────────────────────────────────────
 
-export function buildStatusComment(stage: "queued" | "working" | "pr-opened" | "failed", errorCategory?: string, prUrl?: string, hint?: string): string {
+export type StatusStage =
+  | "queued"
+  | "working"
+  | "pr-opened"
+  | "branch-pushed"
+  | "plan-pending"
+  | "dry-run"
+  | "no-changes"
+  | "failed";
+
+export function buildStatusComment(
+  stage: StatusStage,
+  errorCategory?: string,
+  prUrl?: string,
+  hint?: string,
+  notes: string[] = []
+): string {
   let text = `${BOT_COMMENT_MARKER}\n\n`;
+  const clean = (s: string) => redact(s.replace(/\s+at\s+\S+/g, "").replace(/\n{2,}/g, "\n").trim());
 
   switch (stage) {
     case "queued":
       text += "⏳ **Queued** — waiting for a worker slot.";
       break;
     case "working":
-      text += "🔨 **Working** — LLM is generating a solution.";
+      text += "🔨 **Working** — generating a solution.";
       break;
     case "pr-opened":
-      text += prUrl
-        ? `✅ **PR opened!** [View PR](${prUrl})`
-        : "✅ **PR opened!**";
+      text += prUrl ? `✅ **PR opened!** [View PR](${prUrl})` : "✅ **PR opened!**";
+      break;
+    case "branch-pushed":
+      text += `✅ **Branch pushed** — \`${hint ?? ""}\` (no PR opened, as requested).`;
+      break;
+    case "plan-pending":
+      text += "📝 **Plan ready** — see the plan comment below. A collaborator can reply `/luci go` to implement it or `/luci cancel` to drop it.";
+      break;
+    case "dry-run":
+      text += "🧪 **Dry run** — a solution was generated but nothing was pushed. See the summary comment below.";
+      break;
+    case "no-changes":
+      text += "ℹ️ **No changes** — the generated solution did not change any file. Add more detail to the issue and reply `/luci retry`.";
       break;
     case "failed":
       text += `❌ **Failed** — ${errorCategory ?? "unknown"}\n\n`;
-      if (hint) text += `💡 ${hint.replace(/\s+at\s+\S+/g, "").replace(/\n{2,}/g, "\n").trim()}\n\n`;
-      text += "Please label this issue `needs-retry` to attempt again.";
+      if (hint) text += `💡 ${clean(hint)}\n\n`;
+      text += "Reply `/luci retry` (or add the `needs-retry` label) to try again.";
       break;
+  }
+
+  if (notes.length > 0) {
+    text += "\n\n**Notes:**\n" + notes.map((n) => `- ${clean(n)}`).join("\n");
   }
 
   return text;
