@@ -144,6 +144,13 @@ async function ollamaChat(
   throw lastError ?? new Error("Ollama chat failed after retries");
 }
 
+export class TruncatedResponseError extends Error {
+  constructor(maxTokens: number) {
+    super(`Model response truncated at max_tokens=${maxTokens}`);
+    this.name = "TruncatedResponseError";
+  }
+}
+
 async function adessoChat(
   apiKey: string,
   baseUrl: string,
@@ -171,8 +178,13 @@ async function adessoChat(
   });
 
   let content = "";
+  let finishReason: string | null | undefined;
   for await (const chunk of stream) {
     content += chunk.choices[0]?.delta?.content ?? "";
+    finishReason = chunk.choices[0]?.finish_reason ?? finishReason;
+  }
+  if (finishReason === "length") {
+    throw new TruncatedResponseError(maxTokens);
   }
   return stripThinkingTags(content);
 }
@@ -246,14 +258,23 @@ export async function generateSolution(
     ? `\nExisting files in repo:\n${existingFiles.map((f) => `  - ${f}`).join("\n")}\n\nFor each file you need to modify, specify the full path as it appears above.`
     : "";
 
-  const response = await adessoChat(
-    apiKey,
-    config.adassoBaseUrl,
-    config.adassoModel,
-    prompt.system,
-    prompt.user + fileContext,
-    14000
-  );
+  let response: string;
+  try {
+    response = await adessoChat(
+      apiKey,
+      config.adassoBaseUrl,
+      config.adassoModel,
+      prompt.system,
+      prompt.user + fileContext,
+      14000
+    );
+  } catch (err) {
+    // A cut-off answer yields half-written files; never turn it into a PR.
+    if (err instanceof TruncatedResponseError) {
+      return { success: false, files: [], branchName: "", commitMessage: "", error: `${err.message}. Narrow the issue scope or split it.` };
+    }
+    throw err;
+  }
 
   return parseLLMResponse(response);
 }
