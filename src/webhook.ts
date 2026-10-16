@@ -215,6 +215,10 @@ export function createWebhookApp(config?: ReturnType<typeof getConfig>): express
   ));
 
   // Webhook endpoint
+  app.get("/version", (_req: Request, res: Response) => {
+    res.json({ name: "luci-github-bot", version: "0.1.0" });
+  });
+
   app.post(
     "/webhook",
     (err: any, _req: Request, res: Response, next: NextFunction) => {
