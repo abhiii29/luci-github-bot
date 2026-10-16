@@ -16,7 +16,8 @@ scripts/smoke/run.sh --worker  # + real container against git daemon and a stub 
 
 ## Where things live
 
-- Request path: `webhook.ts` → `dispatch.ts` (enqueue) → `queue.ts`/`store.ts` → `issue-handler.ts`
+- Entrypoints: `index.ts` (webhook server) and `action.ts` (GitHub Action, one event per run); both wire handlers via `bootstrap.ts`
+- Request path: `webhook.ts` (`routeEvent`) → `dispatch.ts` (enqueue) → `queue.ts`/`store.ts` → `issue-handler.ts`
 - `/luci` commands: `command-handler.ts` (hooks) + `commands.ts` (parsing, collaborator gate)
 - Effective per-job options: `job-context.ts` (network) + `job-options.ts` (pure merge + globs)
 - What may leave the bot: `solution-validator.ts` + `secret-scan.ts`; worker.sh re-checks paths

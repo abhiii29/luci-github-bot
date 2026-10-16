@@ -8,6 +8,9 @@ Ollama model (7B–8B, with task decomposition).
 
 ## Quick Start
 
+**No server needed:** run it as a GitHub Action instead — each issue event starts a workflow run.
+See [docs/GITHUB_ACTION.md](docs/GITHUB_ACTION.md). The steps below are for the self-hosted webhook server.
+
 ```bash
 cp .env.example .env      # fill in GITHUB_TOKEN, WEBHOOK_SECRET, MONITORED_REPOS, ...
 npm install

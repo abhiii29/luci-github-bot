@@ -2,26 +2,10 @@ import { execFile, execFileSync } from "child_process";
 import fs from "fs";
 import { promisify } from "util";
 import express from "express";
-import {
-  createWebhookApp,
-  setDockerWorker,
-  onIssue,
-  onRetry,
-  onComment,
-  onIssueEdited,
-  onQueued,
-  setQueueStore,
-} from "./webhook.js";
-import { handleIssue, retryQueuedIssue, markIssueQueued, setIssueWorker } from "./issue-handler.js";
-import { handleIssueComment } from "./command-handler.js";
-import { initDispatch, enqueueIssue, eventFromJob, isJobCancelled } from "./dispatch.js";
-import { computeJobOptions } from "./job-context.js";
-import { getPlanState, hashIssueBody, invalidatePlan } from "./plan.js";
-import { GitHubClient } from "./github.js";
+import { createWebhookApp } from "./webhook.js";
+import { setupBot } from "./bootstrap.js";
 import { getConfig } from "./config.js";
-import { DockerWorker } from "./docker-worker.js";
 import { JsonQueueStore } from "./store.js";
-import { JobQueue } from "./queue.js";
 import { logger } from "./logger.js";
 import { redact, addSecret } from "./redact.js";
 
@@ -189,9 +173,9 @@ function validateStartup(config: ReturnType<typeof getConfig>): string[] {
 
   const apiKeyPath = config.adassoApiKeyFile.replace(/^~($|\/)/, process.env.HOME + "/");
   try {
-    fs.accessSync(apiKeyPath, fs.constants.R_OK);
+    if (!config.adassoApiKey) fs.accessSync(apiKeyPath, fs.constants.R_OK);
   } catch {
-    problems.push(`API key file not readable: ${config.adassoApiKeyFile}`);
+    problems.push(`API key file not readable: ${config.adassoApiKeyFile} (or set ADASSO_API_KEY)`);
   }
 
   for (const repo of config.monitoredRepos) {
@@ -247,54 +231,15 @@ async function main() {
     port: config.listenPort,
   });
 
-  // One worker (one semaphore + resource monitor) shared by the whole bot
-  const worker = new DockerWorker();
-  setDockerWorker(worker);
-  setIssueWorker(worker);
-  await worker.ensureImage();
-  logger.info("[init] Worker ready");
-
-  // Durable queue: every job (assignment, retry, /luci command) goes through it
   const store = new JsonQueueStore();
-  const queue = new JobQueue(store, config.maxConcurrentWorkers);
-  queue.setProcessor(async (job) => {
-    const event = eventFromJob(job);
-    if (!event) return { success: false, error: "invalid_job_payload", retryable: false };
-    return handleIssue(event, { isCancelled: () => isJobCancelled(job.id) });
-  });
-  initDispatch(store, queue);
+  const { worker, queue } = await setupBot(config, store);
 
   const recovered = store.recoverInterrupted();
   if (recovered.length > 0) {
     logger.info(`[queue] Recovered ${recovered.length} job(s) interrupted by the last shutdown`);
   }
 
-  onIssue(handleIssue); // only used when no queue is configured
-  onQueued(markIssueQueued);
-  onComment(handleIssueComment);
-  onRetry(async (event) => {
-    event.jobOptions = await computeJobOptions(event, config.githubToken);
-    const r = enqueueIssue(event);
-    if (r.status === "queued") await retryQueuedIssue(event);
-  });
-  onIssueEdited(async (event) => {
-    const [owner, repo] = event.repository.full_name.split("/");
-    const before = getPlanState(owner, repo, event.issue.number);
-    if (!before || before.status !== "pending") return;
-    const after = invalidatePlan(owner, repo, event.issue.number, hashIssueBody(event.issue.body ?? ""));
-    if (after?.status === "expired") {
-      await new GitHubClient({ token: config.githubToken })
-        .createComment(
-          event.repository.full_name,
-          event.issue.number,
-          "📝 The issue changed, so the pending plan is no longer valid. Reply `/luci plan` to re-plan."
-        )
-        .catch(() => {});
-    }
-  });
-
   const app = createWebhookApp(config);
-  setQueueStore(store);
 
   onShutdown(async () => {
     stopNgrokTunnels();

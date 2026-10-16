@@ -6,6 +6,8 @@ const configSchema = z.object({
   githubToken: z.string().min(5, "GITHUB_TOKEN must be a valid PAT"),
   adassoBaseUrl: z.string().url("ADASSO_BASE_URL must be a valid URL"),
   adassoApiKeyFile: z.string().default("~/.config/opencode/adesso.key"),
+  /** Key given directly (CI secrets); takes precedence over adassoApiKeyFile. */
+  adassoApiKey: z.string().optional(),
   adassoModel: z.string().default("qwen-3.6-35b-sovereign"),
   ngrokAuthToken: z.string().min(10).optional(),
   listenPort: z.coerce.number().default(3000),
@@ -94,6 +96,7 @@ export function getConfig(): Config {
     githubToken: env.GITHUB_TOKEN ?? "",
     adassoBaseUrl: env.ADASSO_BASE_URL ?? "https://adesso-ai-hub.3asabc.de/v1",
     adassoApiKeyFile: env.ADASSO_API_KEY_FILE ?? "~/.config/opencode/adesso.key",
+    adassoApiKey: env.ADASSO_API_KEY || undefined,
     adassoModel: env.ADASSO_MODEL ?? "qwen-3.6-35b-sovereign",
     ngrokAuthToken: env.NGROK_AUTHTOKEN || undefined,
     listenPort: env.LISTEN_PORT ?? "3000",
@@ -142,6 +145,7 @@ export function getConfig(): Config {
 
 export async function getAdessoApiKey(): Promise<string> {
   const config = getConfig();
+  if (config.adassoApiKey) return config.adassoApiKey.trim();
   const filePath = expandHome(config.adassoApiKeyFile);
   const content = fs.readFileSync(filePath, "utf-8").trim();
   return content;

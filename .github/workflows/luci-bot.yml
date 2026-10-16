@@ -1,0 +1,77 @@
+# Reusable workflow: runs luci-github-bot for one issue event, then exits.
+# Monitored repos call it with a small stub (see docs/github-action/luci-bot.yml).
+name: luci-bot
+
+on:
+  workflow_call:
+    inputs:
+      bot-username:
+        description: Login of the account issues are assigned to (owner of bot-token)
+        type: string
+        required: true
+      bot-repository:
+        description: Where the bot's code lives
+        type: string
+        default: abhiii29/luci-github-bot
+      bot-ref:
+        description: Branch, tag or SHA of the bot to run
+        type: string
+        default: main
+      adesso-base-url:
+        type: string
+        default: https://adesso-ai-hub.3asabc.de/v1
+      adesso-model:
+        type: string
+        default: qwen-3.6-35b-sovereign
+      dry-run:
+        description: Report what would change, never push
+        type: boolean
+        default: false
+    secrets:
+      bot-token:
+        description: PAT (or App token) of bot-username with repo scope. Not GITHUB_TOKEN — PRs it opens would not trigger CI.
+        required: true
+      adesso-api-key:
+        required: true
+
+# The bot itself uses bot-token
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the bot
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.bot-repository }}
+          ref: ${{ inputs.bot-ref }}
+          token: ${{ secrets.bot-token }}
+          path: bot
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bot/package-lock.json
+
+      - name: Build
+        working-directory: bot
+        run: npm ci && npm run build
+
+      - name: Run bot
+        working-directory: bot
+        run: node dist/action.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.bot-token }}
+          GITHUB_BOT_USERNAME: ${{ inputs.bot-username }}
+          ADASSO_API_KEY: ${{ secrets.adesso-api-key }}
+          ADASSO_BASE_URL: ${{ inputs.adesso-base-url }}
+          ADASSO_MODEL: ${{ inputs.adesso-model }}
+          DRY_RUN: ${{ inputs.dry-run && '1' || '' }}
+          # Per-issue state is carried in a hidden comment on the issue (issue-state.ts)
+          LUCI_STATE_DIR: .luci-state
+
